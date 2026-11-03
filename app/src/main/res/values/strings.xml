@@ -1,4 +1,5 @@
 <resources>
     <string name="app_name">CoolConnect</string>
     <string name="google_maps_key">YOUR_GOOGLE_MAPS_KEY_HERE</string>
+    <string name="ai_secret_key">YOUR_AI_SECRET_KEY_HERE</string>
 </resources>

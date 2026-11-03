@@ -56,5 +56,9 @@ object AppModule {
 
     @Provides
     @Singleton
-    fun provideAIManager(): CoolConnectAIManager = CoolConnectAIManager()
+    fun provideAiAssistantRepository(
+        auth: FirebaseAuth,
+        db: FirebaseFirestore,
+        @ApplicationContext context: Context
+    ): AiAssistantRepository = AiAssistantRepository(auth = auth, db = db, context = context)
 }

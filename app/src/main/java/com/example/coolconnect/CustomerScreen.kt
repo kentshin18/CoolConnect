@@ -1,7 +1,11 @@
 package com.example.coolconnect
 
+import androidx.activity.compose.BackHandler
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,8 +26,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Assignment
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.ExitToApp
@@ -36,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -45,6 +52,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import coil.compose.AsyncImage
 import com.example.coolconnect.ui.theme.*
 import com.google.android.gms.location.LocationServices
@@ -77,8 +87,10 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
 
     var currentTab by remember { mutableStateOf(CustomerTab.HOME) }
     var activeChatId by remember { mutableStateOf<String?>(null) }
+    var activeRecipientUserId by remember { mutableStateOf<String?>(null) }
     var activeChatName by remember { mutableStateOf("") }
-    
+    var isCheckingOut by remember { mutableStateOf(false) }
+
     val customerName by viewModel.customerName.collectAsState()
     val aiRecommendation by viewModel.aiRecommendation.collectAsState()
     val profilePicUrl by viewModel.profilePicUrl.collectAsState()
@@ -86,9 +98,18 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
 
     // Privacy & Permissions State
     var showPrivacyConsent by remember { mutableStateOf(false) }
+    var showLocationDialog by remember { mutableStateOf(false) }
 
-    // SOS Emergency State
-    var showEmergencyDialog by remember { mutableStateOf(false) }
+    val isLocationEnabledAndGranted = remember(context) {
+        {
+            val hasPerm = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+                    ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+            val locationManager = context.getSystemService(android.content.Context.LOCATION_SERVICE) as? android.location.LocationManager
+            val isGpsOn = locationManager?.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER) == true ||
+                    locationManager?.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER) == true
+            hasPerm && isGpsOn
+        }
+    }
 
     LaunchedEffect(userHasConsented) {
         if (!userHasConsented) {
@@ -98,11 +119,53 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
 
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { }
+    ) { permissions ->
+        val fineGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] ?: false
+        val coarseGranted = permissions[Manifest.permission.ACCESS_COARSE_LOCATION] ?: false
+        if (!fineGranted && !coarseGranted) {
+            showLocationDialog = true
+        } else {
+            showLocationDialog = !isLocationEnabledAndGranted()
+        }
+    }
+
+    // Reactive BroadcastReceiver for GPS On/Off + Lifecycle ON_RESUME listener
+    DisposableEffect(context) {
+        val receiver = object : android.content.BroadcastReceiver() {
+            override fun onReceive(ctx: android.content.Context?, intent: Intent?) {
+                if (userHasConsented) {
+                    showLocationDialog = !isLocationEnabledAndGranted()
+                }
+            }
+        }
+        val filter = android.content.IntentFilter(android.location.LocationManager.PROVIDERS_CHANGED_ACTION)
+        context.registerReceiver(receiver, filter)
+
+        val lifecycleOwner = (context as? LifecycleOwner)
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                if (userHasConsented) {
+                    showLocationDialog = !isLocationEnabledAndGranted()
+                }
+            }
+        }
+        lifecycleOwner?.lifecycle?.addObserver(observer)
+
+        onDispose {
+            try {
+                context.unregisterReceiver(receiver)
+            } catch (_: Exception) {}
+            lifecycleOwner?.lifecycle?.removeObserver(observer)
+        }
+    }
 
     // Live Location Broadcasting for Customer
     LaunchedEffect(userHasConsented) {
         if (userHasConsented) {
+            if (!isLocationEnabledAndGranted()) {
+                showLocationDialog = true
+            }
+
             val permissions = mutableListOf(
                 Manifest.permission.ACCESS_FINE_LOCATION,
                 Manifest.permission.ACCESS_COARSE_LOCATION
@@ -113,7 +176,7 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
             launcher.launch(permissions.toTypedArray())
 
             while (true) {
-                if (ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                if (isLocationEnabledAndGranted()) {
                     fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).addOnSuccessListener { location ->
                         if (location != null) {
                             viewModel.updateLocation(location.latitude, location.longitude)
@@ -122,6 +185,15 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
                 }
                 kotlinx.coroutines.delay(10.seconds)
             }
+        }
+    }
+
+    // Intercept Back Button to prevent accidental logout/exit
+    BackHandler(enabled = activeChatId == null) {
+        if (currentTab != CustomerTab.HOME) {
+            currentTab = CustomerTab.HOME
+        } else {
+            (context as? android.app.Activity)?.finish()
         }
     }
 
@@ -134,16 +206,45 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
         )
     }
 
-    if (showEmergencyDialog) {
-        EmergencySosDialog(
-            customerName = customerName,
-            onDismiss = { showEmergencyDialog = false }
+    if (showLocationDialog) {
+        CustomerLocationPermissionDialog(
+            onGrantPermission = {
+                val permissions = mutableListOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                )
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                    permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+                }
+                launcher.launch(permissions.toTypedArray())
+            },
+            onEnableGps = {
+                val intent = Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+                context.startActivity(intent)
+            },
+            onOpenSettings = {
+                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", context.packageName, null)
+                }
+                context.startActivity(intent)
+            },
+            onDismiss = { showLocationDialog = false }
         )
     }
 
-    if (activeChatId != null) {
+    if (isCheckingOut) {
+        FullScreenCheckoutScreen(
+            viewModel = viewModel,
+            onBack = { isCheckingOut = false },
+            onOrderPlaced = {
+                isCheckingOut = false
+                currentTab = CustomerTab.TRACK
+            }
+        )
+    } else if (activeChatId != null) {
         FullChatScreen(
             chatId = activeChatId!!,
+            recipientUserId = activeRecipientUserId,
             recipientName = activeChatName,
             currentUserId = auth.currentUser?.uid ?: "cust",
             currentUserName = customerName,
@@ -157,19 +258,22 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(
                                 modifier = Modifier
-                                    .size(32.dp)
-                                    .background(PrimaryBlue.copy(0.12f), CircleShape),
+                                    .size(34.dp)
+                                    .background(PrimaryBlue.copy(0.12f), RoundedCornerShape(10.dp)),
                                 contentAlignment = Alignment.Center
                             ) {
                                 Icon(Icons.Default.AcUnit, null, tint = PrimaryBlue, modifier = Modifier.size(18.dp))
                             }
                             Spacer(modifier = Modifier.width(10.dp))
-                            Text(currentTab.label, fontWeight = FontWeight.Bold, fontSize = 20.sp, color = TextDark)
+                            Column {
+                                Text(currentTab.label, fontWeight = FontWeight.Black, fontSize = 18.sp, color = TextDark)
+                                Text("CoolConnect • Customer Portal", fontSize = 10.sp, color = Color.Gray, fontWeight = FontWeight.Medium)
+                            }
                         }
                     },
                     actions = {
-                        IconButton(onClick = { showEmergencyDialog = true }) {
-                            Icon(Icons.Default.Warning, contentDescription = "SOS", tint = Color(0xFFD32F2F), modifier = Modifier.size(26.dp))
+                        IconButton(onClick = { currentTab = CustomerTab.CHAT }) {
+                            Icon(Icons.AutoMirrored.Filled.Chat, contentDescription = "Support", tint = PrimaryBlue, modifier = Modifier.size(22.dp))
                         }
                         IconButton(onClick = { currentTab = CustomerTab.PROFILE }) {
                             if (profilePicUrl != null) {
@@ -190,6 +294,7 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
             bottomBar = {
                 CustomerBottomBar(currentTab = currentTab, onTabSelected = { currentTab = it })
             },
+            contentWindowInsets = WindowInsets(0, 0, 0, 0),
             containerColor = AppLightBg
         ) { innerPadding ->
             Box(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
@@ -205,12 +310,21 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
                             onNavigateToServices = { currentTab = CustomerTab.SERVICES },
                             onNavigateToTrack = { currentTab = CustomerTab.TRACK },
                             onNavigateToShop = { currentTab = CustomerTab.SHOP },
-                            onTriggerSos = { showEmergencyDialog = true }
+                            onNavigateToSupport = { currentTab = CustomerTab.CHAT }
                         )
                         CustomerTab.SERVICES -> CustomerServicesView()
                         CustomerTab.TRACK -> OrderTrackingView()
-                        CustomerTab.SHOP -> ProductCatalogView()
-                        CustomerTab.CHAT -> CustomerChatHubView(onChatSelected = { id, name -> activeChatId = id; activeChatName = name })
+                        CustomerTab.SHOP -> ProductCatalogView(viewModel = viewModel, onProceedToCheckout = { isCheckingOut = true })
+                        CustomerTab.CHAT -> ConversationListScreen(
+                            currentUserId = auth.currentUser?.uid ?: "",
+                            currentUserName = customerName,
+                            userRole = "customer",
+                            onChatSelected = { id, recipientUserId, name ->
+                                activeChatId = id
+                                activeRecipientUserId = recipientUserId
+                                activeChatName = name
+                            }
+                        )
                         CustomerTab.PROFILE -> CustomerProfileView(onLogout)
                     }
                 }
@@ -223,16 +337,16 @@ fun CustomerScreen(onLogout: () -> Unit, viewModel: CustomerViewModel = hiltView
 fun CustomerBottomBar(currentTab: CustomerTab, onTabSelected: (CustomerTab) -> Unit) {
     NavigationBar(
         containerColor = Color.White,
-        tonalElevation = 8.dp,
-        modifier = Modifier.height(68.dp)
+        tonalElevation = 0.dp,
+        modifier = Modifier.height(64.dp).border(BorderStroke(0.5.dp, Color(0xFFE2E8F0)))
     ) {
         CustomerTab.entries.forEach { tab ->
             val selected = currentTab == tab
             NavigationBarItem(
                 selected = selected,
                 onClick = { onTabSelected(tab) },
-                icon = { Icon(tab.icon, contentDescription = tab.label, tint = if (selected) PrimaryBlue else Color(0xFF757575), modifier = Modifier.size(22.dp)) },
-                label = { Text(tab.label, fontSize = 9.sp, maxLines = 1, softWrap = false, color = if (selected) PrimaryBlue else Color(0xFF616161)) },
+                icon = { Icon(tab.icon, contentDescription = tab.label, tint = if (selected) PrimaryBlue else Color(0xFF64748B), modifier = Modifier.size(20.dp)) },
+                label = { Text(tab.label, fontSize = 9.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 1, color = if (selected) PrimaryBlue else Color(0xFF64748B)) },
                 colors = NavigationBarItemDefaults.colors(indicatorColor = PrimaryBlue.copy(alpha = 0.12f))
             )
         }
@@ -247,15 +361,15 @@ fun CustomerHomeView(
     onNavigateToServices: () -> Unit,
     onNavigateToTrack: () -> Unit,
     onNavigateToShop: () -> Unit,
-    onTriggerSos: () -> Unit
+    onNavigateToSupport: () -> Unit
 ) {
     val db = remember { FirebaseFirestore.getInstance() }
     val auth = remember { FirebaseAuth.getInstance() }
     val uid = auth.currentUser?.uid ?: ""
 
     var activeService by remember { mutableStateOf<Map<String, Any>?>(null) }
+    var activeTechPic by remember { mutableStateOf<String?>(null) }
     var lastServiceDate by remember { mutableStateOf<com.google.firebase.Timestamp?>(null) }
-    val myAssets = remember { mutableStateListOf<Map<String, Any>>() }
     
     val timeGreeting = remember {
         val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
@@ -266,39 +380,41 @@ fun CustomerHomeView(
         }
     }
 
+    LaunchedEffect(activeService) {
+        val techName = activeService?.get("technician")?.toString()
+        if (!techName.isNullOrBlank() && techName != "Next Available Specialist") {
+            db.collection("users").whereEqualTo("role", "technician").whereEqualTo("name", techName)
+                .get().addOnSuccessListener { snapshot ->
+                    activeTechPic = snapshot.documents.firstOrNull()?.getString("profilePicUrl")
+                }
+        } else {
+            activeTechPic = null
+        }
+    }
+
     LaunchedEffect(uid) {
         if (uid.isNotEmpty()) {
-            // Fetch Assets (from services that contain "Hardware Order")
-            db.collection("chats_v2").document("admin_$uid").collection("services")
-                .whereGreaterThanOrEqualTo("issue", "Hardware Order")
-                .addSnapshotListener { snapshot, _ ->
-                    myAssets.clear()
-                    snapshot?.documents?.forEach { doc ->
-                        val data = doc.data ?: return@forEach
-                        myAssets.add(data)
-                    }
-                }
-
-            // Fetch Active Service & Maintenance Timing
-            db.collection("chats_v2").document("admin_$uid").collection("services")
-                .orderBy("timestamp", Query.Direction.DESCENDING)
+            // Fetch Active Service & Maintenance Timing from service_requests
+            db.collection("service_requests")
+                .whereEqualTo("customerUid", uid)
                 .addSnapshotListener { snapshot, _ ->
                     val docs = snapshot?.documents ?: emptyList()
-                    val latest = docs.firstOrNull()
-                    
-                    if (latest != null) {
-                        val data = latest.data?.toMutableMap() ?: mutableMapOf()
-                        val status = data["status"]?.toString() ?: ""
-                        if (!status.equals("Completed", ignoreCase = true) && !status.equals("Cancelled", ignoreCase = true) && !status.equals("Denied", ignoreCase = true)) {
-                            activeService = data
-                        } else {
-                            activeService = null
-                        }
-
-                        // Last completed service for maintenance check
-                        val lastComp = docs.firstOrNull { it.getString("status") == "Completed" }
-                        lastServiceDate = lastComp?.getTimestamp("timestamp")
+                    val activeDoc = docs.firstOrNull { doc ->
+                        val st = doc.getString("status")?.lowercase() ?: ""
+                        st.isNotBlank() && st != "completed" && st != "cancelled" && st != "denied" && st != "request cancelled"
                     }
+                    
+                    if (activeDoc != null) {
+                        val data = activeDoc.data?.toMutableMap() ?: mutableMapOf()
+                        data["docId"] = activeDoc.id
+                        activeService = data
+                    } else {
+                        activeService = null
+                    }
+
+                    // Last completed service for maintenance check
+                    val lastComp = docs.firstOrNull { it.getString("status")?.equals("Completed", ignoreCase = true) == true }
+                    lastServiceDate = lastComp?.getTimestamp("createdAt") ?: lastComp?.getTimestamp("completedAt")
                 }
         }
     }
@@ -348,9 +464,27 @@ fun CustomerHomeView(
                         Text("Status: ${activeService!!["status"] ?: "Pending"}", color = PrimaryBlue, fontWeight = FontWeight.Bold, fontSize = 12.sp)
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
-                    Text(activeService!!["issue"]?.toString() ?: "HVAC Service", fontWeight = FontWeight.Bold, color = TextDark, fontSize = 16.sp)
-                    Text("Technician: ${activeService!!["technician"] ?: "Next Available Specialist"}", fontSize = 12.sp, color = Color.Gray)
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (activeTechPic != null) {
+                            AsyncImage(
+                                model = activeTechPic,
+                                contentDescription = "Technician",
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .clip(CircleShape)
+                                    .border(2.dp, PrimaryBlue, CircleShape),
+                                contentScale = ContentScale.Crop
+                            )
+                            Spacer(modifier = Modifier.width(12.dp))
+                        }
+
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(activeService!!["issue"]?.toString() ?: "HVAC Service", fontWeight = FontWeight.Bold, color = TextDark, fontSize = 15.sp)
+                            Text("Technician: ${activeService!!["technician"] ?: "Next Available Specialist"}", fontSize = 12.sp, color = Color.Gray)
+                        }
+                    }
 
                     Spacer(modifier = Modifier.height(12.dp))
                     ServiceStepTimeline(status = activeService!!["status"]?.toString() ?: "pending")
@@ -383,7 +517,7 @@ fun CustomerHomeView(
 
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
             QuickActionCard("Hardware Shop", Icons.Default.ShoppingCart, Color(0xFF7B61FF), Modifier.weight(1f), onNavigateToShop)
-            QuickActionCard("Emergency SOS", Icons.Default.Warning, Color(0xFFD32F2F), Modifier.weight(1f), onTriggerSos)
+            QuickActionCard("Support Chat", Icons.AutoMirrored.Filled.Chat, PrimaryBlue, Modifier.weight(1f), onNavigateToSupport)
         }
 
         Spacer(modifier = Modifier.height(22.dp))
@@ -446,34 +580,6 @@ fun CustomerHomeView(
             }
         }
 
-        // 📱 MY SMART ASSETS SECTION
-        if (myAssets.isNotEmpty()) {
-            Text("MY SMART TECH", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF888888), modifier = Modifier.padding(start = 2.dp, bottom = 8.dp))
-            LazyRow(
-                modifier = Modifier.fillMaxWidth().padding(bottom = 22.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                items(myAssets.toList()) { asset ->
-                    val assetName = asset["issue"]?.toString()?.replace("Hardware Order: ", "")?.split(" (")?.firstOrNull() ?: "Device"
-                    Card(
-                        modifier = Modifier.width(140.dp),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(containerColor = Color.White),
-                        border = BorderStroke(1.dp, Color(0xFFF0F0F0))
-                    ) {
-                        Column(modifier = Modifier.padding(12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            Box(modifier = Modifier.size(40.dp).background(PrimaryBlue.copy(0.08f), CircleShape), contentAlignment = Alignment.Center) {
-                                Icon(getProductIcon(assetName, ""), null, tint = PrimaryBlue, modifier = Modifier.size(20.dp))
-                            }
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(assetName, fontWeight = FontWeight.Bold, fontSize = 11.sp, maxLines = 1, textAlign = TextAlign.Center)
-                            Text("Active • Protected", color = PrimaryGreen, fontSize = 9.sp, fontWeight = FontWeight.Black)
-                        }
-                    }
-                }
-            }
-        }
-
         // 🧹 STANDARD MAINTENANCE CARD (Shown if no reminder is active)
         if (!needsMaintenance) {
             Card(
@@ -526,277 +632,178 @@ fun CustomerServicesView() {
     TechnicianDirectoryView()
 }
 
-// 🚨 EMERGENCY REPAIR SOS DIALOG
-@Composable
-fun EmergencySosDialog(
-    customerName: String,
-    onDismiss: () -> Unit
-) {
-    val db = remember { FirebaseFirestore.getInstance() }
-    val auth = remember { FirebaseAuth.getInstance() }
-    val context = LocalContext.current
-
-    var customerPhone by remember { mutableStateOf("") }
-    var customerAddress by remember { mutableStateOf("") }
-    var isSubmitting by remember { mutableStateOf(false) }
-
-    val emergencyIssues = listOf(
-        "❄️ AC Leaking Water / Sudden Breakdown",
-        "⚡ Electrical Power Trip / Burning Smell",
-        "🔒 Smart Lock Biometric Emergency Lockout",
-        "🚰 Water Pipeline Pressure / Sudden Leakage"
-    )
-
-    var selectedIssue by remember { mutableStateOf(emergencyIssues[0]) }
-    var isAnalyzingSound by remember { mutableStateOf(false) }
-    var aiDiagnosticResult by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(Unit) {
-        val uid = auth.currentUser?.uid
-        if (uid != null) {
-            db.collection("users").document(uid).get().addOnSuccessListener { doc ->
-                customerPhone = doc.getString("phone") ?: ""
-                customerAddress = doc.getString("address") ?: ""
-            }
-        }
-    }
-
-    if (isAnalyzingSound) {
-        LaunchedEffect(Unit) {
-            kotlinx.coroutines.delay(3000)
-            aiDiagnosticResult = "🔍 AI Analysis (Sound ID): High probability of Fan Motor Obstruction or Bearing Wear. Advised to shut down unit immediately to prevent compressor burn."
-            isAnalyzingSound = false
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Warning, null, tint = Color(0xFFD32F2F), modifier = Modifier.size(28.dp))
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Emergency SOS Repair", fontWeight = FontWeight.Black, fontSize = 18.sp, color = TextDark)
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState())
-            ) {
-                Text(
-                    "Immediately dispatches the nearest available technician for urgent HVAC & electrical emergencies.",
-                    fontSize = 12.sp,
-                    color = Color.Gray
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // ✨ AI SOUND TRIAGE SECTION
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                    colors = CardDefaults.cardColors(containerColor = PrimaryBlue.copy(0.05f)),
-                    border = BorderStroke(1.dp, PrimaryBlue.copy(0.2f))
-                ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.AutoAwesome, null, tint = PrimaryBlue, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Smart AI Diagnostic", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = PrimaryBlue)
-                        }
-                        Text("Hold phone near unit to analyze abnormal sounds.", fontSize = 11.sp, color = Color.Gray)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        
-                        if (aiDiagnosticResult == null) {
-                            Button(
-                                onClick = { isAnalyzingSound = true },
-                                enabled = !isAnalyzingSound,
-                                modifier = Modifier.fillMaxWidth().height(36.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                                shape = RoundedCornerShape(8.dp)
-                            ) {
-                                if (isAnalyzingSound) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Analyzing...", fontSize = 11.sp)
-                                } else {
-                                    Icon(Icons.Default.Mic, null, modifier = Modifier.size(14.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Start Sound Analysis", fontSize = 11.sp)
-                                }
-                            }
-                        } else {
-                            Surface(
-                                color = Color.White,
-                                shape = RoundedCornerShape(8.dp),
-                                border = BorderStroke(1.dp, PrimaryBlue.copy(0.1f))
-                            ) {
-                                Text(
-                                    aiDiagnosticResult!!,
-                                    modifier = Modifier.padding(8.dp),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = TextDark,
-                                    lineHeight = 15.sp
-                                )
-                            }
-                        }
-                    }
-                }
-
-                Text("Select Emergency Issue:", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
-                Spacer(modifier = Modifier.height(8.dp))
-
-                emergencyIssues.forEach { issue ->
-                    val isSel = selectedIssue == issue
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 4.dp)
-                            .clickable { selectedIssue = issue },
-                        shape = RoundedCornerShape(12.dp),
-                        color = if (isSel) Color(0xFFD32F2F).copy(0.12f) else AppLightBg,
-                        border = BorderStroke(1.dp, if (isSel) Color(0xFFD32F2F) else FieldBorder)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(12.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            RadioButton(
-                                selected = isSel,
-                                onClick = { selectedIssue = issue },
-                                colors = RadioButtonDefaults.colors(selectedColor = Color(0xFFD32F2F))
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                issue,
-                                fontSize = 13.sp,
-                                fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
-                                color = if (isSel) Color(0xFFD32F2F) else TextDark
-                            )
-                        }
-                    }
-                }
-
-                Spacer(modifier = Modifier.height(12.dp))
-                HorizontalDivider(color = Color.LightGray.copy(0.3f))
-                Spacer(modifier = Modifier.height(12.dp))
-
-                Text("Dispatch Address:", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = TextDark)
-                Text(
-                    if (customerAddress.isNotBlank()) customerAddress else "Please set your address in Settings first!",
-                    fontSize = 12.sp,
-                    color = Color.Gray
-                )
-            }
-        },
-        confirmButton = {
-            Button(
-                enabled = !isSubmitting && !isAnalyzingSound,
-                onClick = {
-                    if (customerAddress.isBlank()) {
-                        Toast.makeText(context, "Please set your address in Settings before triggering SOS!", Toast.LENGTH_LONG).show()
-                        return@Button
-                    }
-
-                    val uid = auth.currentUser?.uid ?: return@Button
-                    isSubmitting = true
-
-                    val serviceRequest = mapOf(
-                        "technician" to "EMERGENCY SOS / NEXT AVAILABLE",
-                        "status" to "pending",
-                        "isEmergency" to true,
-                        "timestamp" to com.google.firebase.Timestamp.now(),
-                        "issue" to "🚨 SOS: $selectedIssue",
-                        "aiDiagnostic" to aiDiagnosticResult
-                    )
-
-                    val chatUpdate = mapOf(
-                        "customerName" to customerName,
-                        "customerEmail" to (auth.currentUser?.email ?: ""),
-                        "customerPhone" to customerPhone,
-                        "customerAddress" to customerAddress,
-                        "status" to "🚨 URGENT SOS DISPATCH",
-                        "lastRequest" to "🚨 SOS: $selectedIssue",
-                        "timestamp" to com.google.firebase.Timestamp.now()
-                    )
-
-                    db.collection("chats_v2").document("admin_$uid").set(chatUpdate, com.google.firebase.firestore.SetOptions.merge())
-                    db.collection("chats_v2").document("admin_$uid").collection("services").add(serviceRequest)
-
-                    val autoMsg = hashMapOf(
-                        "senderId" to uid,
-                        "senderName" to customerName,
-                        "text" to "🚨 EMERGENCY SOS TRIGGERED! Issue: $selectedIssue.${if (aiDiagnosticResult != null) " AI Diagnostic: $aiDiagnosticResult" else ""} Please dispatch nearest technician immediately!",
-                        "timestamp" to com.google.firebase.Timestamp.now()
-                    )
-                    db.collection("chats_v2").document("admin_$uid").collection("messages").add(autoMsg)
-
-                    Toast.makeText(context, "🚨 Emergency SOS Dispatched! Admin notified.", Toast.LENGTH_LONG).show()
-                    isSubmitting = false
-                    onDismiss()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F)),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                if (isSubmitting) CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
-                else Text("DISPATCH EMERGENCY SOS 🚨", fontWeight = FontWeight.Black)
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
-        }
-    )
-}
-
 // 🛒 3. HARDWARE CATALOG & PRODUCT DETAIL
 @Composable
-fun ProductCatalogView(viewModel: CustomerViewModel = hiltViewModel()) {
+fun ProductCatalogView(
+    viewModel: CustomerViewModel = hiltViewModel(),
+    onProceedToCheckout: () -> Unit = {}
+) {
     val cart by viewModel.cart.collectAsState()
-    val sampleProducts = remember {
+    val db = remember { FirebaseFirestore.getInstance() }
+    val productsList = remember { mutableStateListOf<Product>() }
+    var isLoadingProducts by remember { mutableStateOf(true) }
+
+    val defaultSampleProducts = remember {
         listOf(
             Product(
-                1, "Smart Home Hub", "₱4,500", "Electronics", Color(0xFFE3F2FD),
+                1, "Compressor", "₱8,000", "Compressors", Color(0xFFE3F2FD),
                 badge = "BEST SELLER",
-                description = "Centralized control hub for smart AC, lighting, and security systems. Supports voice control and mobile automation.",
-                specs = "Wi-Fi 6 • Zigbee 3.0 • Voice Control • Low Energy",
-                warranty = "2 Years Official Warranty & Technical Support"
-            ),
-            Product(
-                2, "Wireless Security Cam", "₱2,100", "Security", Color(0xFFF1F8E9),
-                badge = "HOT ITEM",
-                description = "1080p Full HD smart outdoor camera with night vision, motion detection, and real-time smartphone alerts.",
-                specs = "1080p HD • Night Vision • IP66 Weatherproof • Two-Way Audio",
-                warranty = "1 Year Warranty"
-            ),
-            Product(
-                3, "LED Smart Bulb", "₱850", "Lighting", Color(0xFFFFFDE7),
-                badge = "IN STOCK",
-                description = "Dimmable RGB smart LED bulb. Create custom lighting schedules and adjust brightness from your phone.",
-                specs = "9W (60W Equivalent) • 16 Million Colors • App Scheduled",
-                warranty = "1 Year Warranty"
-            ),
-            Product(
-                4, "Smart Door Lock", "₱8,900", "Security", Color(0xFFFCE4EC),
-                badge = "BEST SELLER",
-                description = "Biometric fingerprint smart lock with passcode keypad, RFID card support, and mechanical key backup.",
-                specs = "Fingerprint • Passcode • RFID • Mechanical Key • Anti-Peep",
+                imageUrl = "",
+                description = "Heavy-duty rotary aircon compressor designed for split and window-type HVAC units.",
+                specs = "1.5 HP - 2.5 HP • R410A / R32 Compatible • High Thermal Endurance",
                 warranty = "2 Years Official Warranty"
             ),
             Product(
-                5, "Power Backup UPS", "₱3,200", "Electronics", Color(0xFFE8F5E9),
-                badge = "IN STOCK",
-                description = "Uninterruptible power supply to keep your Wi-Fi routers and security cameras online during power outages.",
-                specs = "650VA / 360W • Surge Protection • Automatic Voltage Regulator",
+                2, "Board", "₱5,500", "Circuit Boards", Color(0xFFF1F8E9),
+                badge = "BEST SELLER",
+                imageUrl = "",
+                description = "Universal inverter & non-inverter air conditioner main control PCB board with display module.",
+                specs = "Multi-Brand Compatible • Relay Protected • Remote Sensor Included",
                 warranty = "1 Year Warranty"
             ),
             Product(
-                6, "Smart Wall Switch", "₱1,150", "Lighting", Color(0xFFFFF3E0),
-                badge = "LIMITED STOCK",
-                description = "Touch-sensitive smart wall switch. Upgrade traditional light switches to smartphone-controlled automation.",
-                specs = "Touch Glass • Neutral Wire Required • Overload Protection",
+                3, "Fan Motor", "₱4,000", "Motors & Fans", Color(0xFFFFFDE7),
+                badge = "IN STOCK",
+                imageUrl = "",
+                description = "High-RPM condenser and evaporator fan motor for outdoor and indoor HVAC units.",
+                specs = "220V / 60Hz • Copper Winding • Sealed Ball Bearings",
+                warranty = "1 Year Warranty"
+            ),
+            Product(
+                4, "Freon", "₱7,800", "Refrigerants", Color(0xFFE8F5E9),
+                badge = "HOT ITEM",
+                imageUrl = "",
+                description = "Genuine high-purity R410A / R32 refrigerant gas cylinder (11.3kg) for AC recharge.",
+                specs = "99.9% Pure Refrigerant • Eco-Friendly Low ODP • 11.3kg Tank",
+                warranty = "Guaranteed Sealed Cylinder"
+            ),
+            Product(
+                5, "Fan Blade", "₱700", "Motors & Fans", Color(0xFFFFF3E0),
+                badge = "IN STOCK",
+                imageUrl = "",
+                description = "Balanced aerodynamic outdoor condenser propeller fan blade engineered for low acoustic noise.",
+                specs = "3-Blade Aerodynamic ABS • UV & Weather Resistant • 400mm Dia",
+                warranty = "1 Year Warranty"
+            ),
+            Product(
+                6, "Fan Blower", "₱550", "Motors & Fans", Color(0xFFE0F7FA),
+                badge = "IN STOCK",
+                imageUrl = "",
+                description = "Precision cross-flow cylindrical indoor blower wheel for split-type indoor evaporator units.",
+                specs = "Anti-Static ABS Plastic • Dynamic Balanced • Fits 0.75HP - 2.0HP",
+                warranty = "1 Year Warranty"
+            ),
+            Product(
+                7, "Sensor", "₱300", "Sensors & Driers", Color(0xFFF3E5F5),
+                badge = "IN STOCK",
+                imageUrl = "",
+                description = "High-sensitivity ambient and coil temperature thermistor sensor for split and window AC units.",
+                specs = "5K / 10K NTC Thermistor • Waterproof Copper Probe • 40cm Lead",
+                warranty = "1 Year Warranty"
+            ),
+            Product(
+                8, "Copper Tube", "₱750", "Refrigerants", Color(0xFFFFF8E1),
+                badge = "IN STOCK",
+                imageUrl = "",
+                description = "Pre-insulated double copper tubing roll (5 meters) for indoor to outdoor split-type AC installation.",
+                specs = "1/4\" & 3/8\" Pair • Seamless Annealed Copper • Fire-Retardant Foam",
+                warranty = "1 Year Warranty"
+            ),
+            Product(
+                9, "Filter Drier", "₱900", "Sensors & Driers", Color(0xFFE8EAF6),
+                badge = "IN STOCK",
+                imageUrl = "",
+                description = "Heavy-duty liquid line filter drier to trap moisture, acid, and foreign particles in HVAC lines.",
+                specs = "1/4\" Flare Connections • Desiccant Moisture Absorber • Solid Core",
                 warranty = "1 Year Warranty"
             )
         )
+    }
+
+    LaunchedEffect(Unit) {
+        db.collection("products").addSnapshotListener { snapshot, _ ->
+            if (snapshot != null && !snapshot.isEmpty) {
+                productsList.clear()
+                snapshot.documents.forEach { doc ->
+                    val name = doc.getString("name") ?: "Product"
+                    // Auto-clean legacy non-HVAC items
+                    val isOldCatalog = name.contains("Hub", true) || name.contains("Security Cam", true) || name.contains("Smart Bulb", true) || name.contains("Door Lock", true) || name.contains("UPS", true) || name.contains("Wall Switch", true)
+                    if (isOldCatalog) {
+                        doc.reference.delete()
+                        return@forEach
+                    }
+
+                    var rawPrice = doc.get("price")
+                    var priceVal = (rawPrice as? Number)?.toDouble() ?: 0.0
+
+                    // Sync catalog price if updated in defaults
+                    val sampleMatch = defaultSampleProducts.firstOrNull { it.name.equals(name, ignoreCase = true) }
+                    if (sampleMatch != null) {
+                        val expectedPrice = sampleMatch.price.replace("₱", "").replace(",", "").toDoubleOrNull() ?: 0.0
+                        if (priceVal != expectedPrice && rawPrice != null) {
+                            priceVal = expectedPrice
+                            doc.reference.update("price", expectedPrice)
+                        }
+                    }
+
+                    val priceStr = "₱${String.format(Locale.getDefault(), "%,.0f", priceVal)}"
+                    val category = doc.getString("category") ?: "Compressors"
+                    val badge = doc.getString("badge") ?: "IN STOCK"
+                    val description = doc.getString("description") ?: "HVAC Hardware & Replacement Part"
+                    val specs = doc.getString("specs") ?: "Heavy-Duty HVAC Grade"
+                    val warranty = doc.getString("warranty") ?: "1 Year Warranty"
+                    val rawImageUrl = doc.getString("imageUrl")
+                    var finalImageUrl = rawImageUrl ?: ""
+
+                    val stockVal = (doc.get("stock") as? Number)?.toInt() ?: 10
+                    val rawBadge = doc.getString("badge") ?: "IN STOCK"
+                    val badgeVal = if (stockVal <= 0) "OUT OF STOCK" else rawBadge
+
+                    val color = when (category) {
+                        "Compressors" -> Color(0xFFE3F2FD)
+                        "Circuit Boards" -> Color(0xFFF1F8E9)
+                        "Motors & Fans" -> Color(0xFFFFFDE7)
+                        "Refrigerants" -> Color(0xFFE8F5E9)
+                        else -> Color(0xFFFFF3E0)
+                    }
+
+                    productsList.add(
+                        Product(
+                            id = doc.id.hashCode(),
+                            name = name,
+                            price = priceStr,
+                            category = category,
+                            color = color,
+                            badge = badgeVal,
+                            imageUrl = finalImageUrl,
+                            description = description,
+                            specs = specs,
+                            warranty = warranty,
+                            stock = stockVal,
+                            docId = doc.id
+                        )
+                    )
+                }
+            } else if (snapshot != null && snapshot.isEmpty) {
+                // Auto-seed new HVAC catalog to Firebase
+                defaultSampleProducts.forEach { sample ->
+                    val sampleData = mapOf(
+                        "name" to sample.name,
+                        "category" to sample.category,
+                        "price" to sample.price.replace("₱", "").replace(",", "").toDouble(),
+                        "stock" to 20,
+                        "badge" to sample.badge,
+                        "imageUrl" to sample.imageUrl,
+                        "description" to sample.description,
+                        "specs" to sample.specs,
+                        "warranty" to sample.warranty,
+                        "timestamp" to com.google.firebase.Timestamp.now()
+                    )
+                    db.collection("products").add(sampleData)
+                }
+            }
+            isLoadingProducts = false
+        }
     }
 
     var searchQuery by remember { mutableStateOf("") }
@@ -804,9 +811,13 @@ fun ProductCatalogView(viewModel: CustomerViewModel = hiltViewModel()) {
     var selectedProduct by remember { mutableStateOf<Product?>(null) }
     var showCartDialog by remember { mutableStateOf(false) }
 
-    val categories = listOf("All", "Electronics", "Security", "Lighting")
+    val categories = remember(productsList.toList()) {
+        listOf("All") + productsList.map { it.category }.distinct()
+    }
 
-    val filteredProducts = sampleProducts.filter { p ->
+    val displayList = if (productsList.isNotEmpty()) productsList else defaultSampleProducts
+
+    val filteredProducts = displayList.filter { p ->
         val matchesCategory = selectedCategory == "All" || p.category == selectedCategory
         val matchesQuery = p.name.contains(searchQuery, ignoreCase = true) || p.description.contains(searchQuery, ignoreCase = true)
         matchesCategory && matchesQuery
@@ -815,14 +826,23 @@ fun ProductCatalogView(viewModel: CustomerViewModel = hiltViewModel()) {
     if (selectedProduct != null) {
         ProductDetailDialog(
             product = selectedProduct!!,
-            onDismiss = { selectedProduct = null }
+            viewModel = viewModel,
+            onDismiss = { selectedProduct = null },
+            onProceedToCheckout = {
+                selectedProduct = null
+                onProceedToCheckout()
+            }
         )
     }
 
     if (showCartDialog) {
         CartDialog(
             viewModel = viewModel,
-            onDismiss = { showCartDialog = false }
+            onDismiss = { showCartDialog = false },
+            onProceedToCheckout = {
+                showCartDialog = false
+                onProceedToCheckout()
+            }
         )
     }
 
@@ -881,11 +901,11 @@ fun ProductCatalogView(viewModel: CustomerViewModel = hiltViewModel()) {
         Spacer(modifier = Modifier.height(16.dp))
 
         // Category Filter Chips
-        Row(
+        LazyRow(
             modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            categories.forEach { cat ->
+            items(categories) { cat ->
                 val isSel = selectedCategory == cat
                 Surface(
                     modifier = Modifier.clickable { selectedCategory = cat }.height(34.dp),
@@ -941,6 +961,7 @@ fun ProductCatalogView(viewModel: CustomerViewModel = hiltViewModel()) {
                             Surface(
                                 shape = RoundedCornerShape(topEnd = 12.dp, bottomStart = 10.dp),
                                 color = when (product.badge) {
+                                    "OUT OF STOCK" -> Color(0xFFD32F2F)
                                     "BEST SELLER" -> Color(0xFFE68A00)
                                     "HOT ITEM" -> Color(0xFFD32F2F)
                                     else -> PrimaryGreen
@@ -966,16 +987,29 @@ fun ProductCatalogView(viewModel: CustomerViewModel = hiltViewModel()) {
                         
                         Spacer(modifier = Modifier.height(8.dp))
                         
+                        val isAvailable = product.stock > 0 && product.badge != "OUT OF STOCK"
                         Button(
-                            onClick = { viewModel.addToCart(product) },
+                            onClick = { if (isAvailable) viewModel.addToCart(product) },
+                            enabled = isAvailable,
                             modifier = Modifier.fillMaxWidth().height(32.dp),
                             contentPadding = PaddingValues(0.dp),
-                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (isAvailable) PrimaryBlue else Color.Gray,
+                                disabledContainerColor = Color(0xFFCBD5E1)
+                            ),
                             shape = RoundedCornerShape(8.dp)
                         ) {
-                            Icon(Icons.Default.AddShoppingCart, null, modifier = Modifier.size(14.dp))
+                            Icon(
+                                imageVector = if (isAvailable) Icons.Default.AddShoppingCart else Icons.Default.Block,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp)
+                            )
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Add to Cart", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            Text(
+                                text = if (isAvailable) "Add to Cart" else "Out of Stock",
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
                     }
                 }
@@ -985,16 +1019,12 @@ fun ProductCatalogView(viewModel: CustomerViewModel = hiltViewModel()) {
 }
 
 @Composable
-fun CartDialog(viewModel: CustomerViewModel, onDismiss: () -> Unit) {
+fun CartDialog(
+    viewModel: CustomerViewModel, 
+    onDismiss: () -> Unit,
+    onProceedToCheckout: () -> Unit
+) {
     val cart by viewModel.cart.collectAsState()
-    var showCheckout by remember { mutableStateOf(false) }
-
-    if (showCheckout) {
-        CheckoutDialog(
-            viewModel = viewModel,
-            onDismiss = { showCheckout = false; onDismiss() }
-        )
-    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1023,12 +1053,15 @@ fun CartDialog(viewModel: CustomerViewModel, onDismiss: () -> Unit) {
         confirmButton = {
             if (cart.isNotEmpty()) {
                 Button(
-                    onClick = { showCheckout = true },
+                    onClick = {
+                        onDismiss()
+                        onProceedToCheckout()
+                    },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
                 ) {
-                    Text("Proceed to Checkout", fontWeight = FontWeight.Bold)
+                    Text("Proceed to Fullscreen Checkout →", fontWeight = FontWeight.Bold)
                 }
             }
         },
@@ -1083,123 +1116,369 @@ fun CartItemRow(item: CartItem, onUpdateQty: (Int) -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CheckoutDialog(viewModel: CustomerViewModel, onDismiss: () -> Unit) {
+fun FullScreenCheckoutScreen(
+    viewModel: CustomerViewModel,
+    onBack: () -> Unit,
+    onOrderPlaced: () -> Unit
+) {
     val cart by viewModel.cart.collectAsState()
     val context = LocalContext.current
-    
-    var step by remember { mutableIntStateOf(1) } // 1: Summary, 2: Shipping, 3: Payment
-    var shippingAddress by remember { mutableStateOf("") }
-    var selectedPayment by remember { mutableStateOf("GCash") }
-    var isProcessing by remember { mutableStateOf(false) }
+    val db = remember { FirebaseFirestore.getInstance() }
+    val auth = remember { FirebaseAuth.getInstance() }
+
+    var streetAddress by remember { mutableStateOf("") }
+    var brgy by remember { mutableStateOf("") }
+    var city by remember { mutableStateOf("") }
+    var province by remember { mutableStateOf("") }
+    var zipCode by remember { mutableStateOf("") }
+    var phone by remember { mutableStateOf("") }
+    var selectedPaymentMethod by remember { mutableStateOf("QR Ph (GCash, Maya, InstaPay)") }
+    var isSubmitting by remember { mutableStateOf(false) }
+    var showSuccessDialog by remember { mutableStateOf(false) }
+    var showQrPhModal by remember { mutableStateOf(false) }
 
     val subtotal = cart.sumOf { it.product.price.replace("₱", "").replace(",", "").toDouble() * it.quantity }
     val vat = subtotal * 0.12
     val total = subtotal + vat
 
     LaunchedEffect(Unit) {
-        // Fetch user default address
-        val uid = FirebaseAuth.getInstance().currentUser?.uid
-        if (uid != null) {
-            FirebaseFirestore.getInstance().collection("users").document(uid).get().addOnSuccessListener { doc ->
-                shippingAddress = doc.getString("address") ?: ""
-            }
+        val uid = auth.currentUser?.uid ?: return@LaunchedEffect
+        db.collection("users").document(uid).get().addOnSuccessListener { doc ->
+            streetAddress = doc.getString("street") ?: doc.getString("address") ?: ""
+            brgy = doc.getString("brgy") ?: ""
+            city = doc.getString("city") ?: ""
+            province = doc.getString("province") ?: ""
+            zipCode = doc.getString("postalCode") ?: ""
+            phone = doc.getString("phone") ?: ""
         }
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Text(
-                text = when(step) { 1 -> "Order Summary"; 2 -> "Shipping Details"; else -> "Secure Payment" },
-                fontWeight = FontWeight.Black
+    if (showQrPhModal) {
+        val fullAddress = listOf(streetAddress, brgy, city, province, zipCode).filter { it.isNotBlank() }.joinToString(", ")
+        QrPhPaymentDialog(
+            amount = total,
+            orderOrServiceId = "ORD-${System.currentTimeMillis().toString().takeLast(6)}",
+            onPaymentConfirmed = { refNum ->
+                showQrPhModal = false
+                isSubmitting = true
+                viewModel.checkout(fullAddress, "QR Ph Paid (Ref: $refNum)") { result ->
+                    isSubmitting = false
+                    result.onSuccess {
+                        showSuccessDialog = true
+                    }.onFailure {
+                        Toast.makeText(context, "Order failed: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            },
+            onDismiss = { showQrPhModal = false }
+        )
+    }
+
+    if (showSuccessDialog) {
+        CelebrationSuccessDialog(
+            title = "Order Placed & Installation Requested!",
+            message = "Your hardware order has been submitted. An Admin will review your items and assign an expert field technician to deliver and install your order at your address.",
+            onDismiss = {
+                showSuccessDialog = false
+                onOrderPlaced()
+            }
+        )
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("Checkout & Order Review", fontWeight = FontWeight.Black, fontSize = 18.sp, color = TextDark)
+                        Text("Review items, address, and select payment", fontSize = 11.sp, color = Color.Gray)
+                    }
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, null, tint = TextDark)
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
             )
         },
-        text = {
-            Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-                when (step) {
-                    1 -> {
-                        cart.forEach { item ->
-                            Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                                Text("${item.quantity}x ${item.product.name}", fontSize = 12.sp, color = TextDark)
-                                Text("₱${String.format(Locale.getDefault(), "%,.2f", item.product.price.replace("₱", "").replace(",", "").toDouble() * item.quantity)}", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        bottomBar = {
+            Surface(
+                color = Color.White,
+                shadowElevation = 8.dp,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column {
+                        Text("TOTAL AMOUNT", fontSize = 10.sp, fontWeight = FontWeight.Black, color = Color.Gray)
+                        Text("₱${String.format(Locale.getDefault(), "%,.2f", total)}", fontSize = 20.sp, fontWeight = FontWeight.Black, color = PrimaryBlue)
+                    }
+
+                    Button(
+                        onClick = {
+                            val fullAddress = listOf(streetAddress, brgy, city, province, zipCode).filter { it.isNotBlank() }.joinToString(", ")
+                            if (fullAddress.length < 5) {
+                                Toast.makeText(context, "Please enter a valid delivery address", Toast.LENGTH_SHORT).show()
+                                return@Button
                             }
-                        }
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color.LightGray.copy(0.3f))
-                        CheckoutPriceRow("Subtotal", subtotal)
-                        CheckoutPriceRow("VAT (12%)", vat)
-                        Row(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Total Amount", fontWeight = FontWeight.Black, fontSize = 16.sp)
-                            Text("₱${String.format(Locale.getDefault(), "%,.2f", total)}", fontWeight = FontWeight.Black, fontSize = 18.sp, color = PrimaryBlue)
+
+                            if (selectedPaymentMethod.startsWith("QR Ph")) {
+                                showQrPhModal = true
+                            } else {
+                                isSubmitting = true
+                                viewModel.checkout(fullAddress, selectedPaymentMethod) { result ->
+                                    isSubmitting = false
+                                    result.onSuccess {
+                                        showSuccessDialog = true
+                                    }.onFailure {
+                                        Toast.makeText(context, "Order failed: ${it.localizedMessage}", Toast.LENGTH_LONG).show()
+                                    }
+                                }
+                            }
+                        },
+                        enabled = !isSubmitting && cart.isNotEmpty(),
+                        modifier = Modifier.height(48.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        if (isSubmitting) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
+                        } else {
+                            Text("Confirm & Place Order", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                         }
                     }
-                    2 -> {
-                        Text("Where should we deliver?", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = shippingAddress,
-                            onValueChange = { shippingAddress = it },
-                            label = { Text("Delivery Address") },
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp)
-                        )
-                        Text("Default address from your profile is used by default.", fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(top = 4.dp))
+                }
+            }
+        },
+        containerColor = AppLightBg
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .verticalScroll(rememberScrollState())
+                .padding(18.dp)
+        ) {
+            // 🚚 DISPATCH & INSTALLATION TRANSPARENCY BANNER
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD)),
+                border = BorderStroke(1.dp, Color(0xFFBBDEFB))
+            ) {
+                Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier.size(42.dp).background(PrimaryBlue, CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(Icons.Default.LocalShipping, null, tint = Color.White)
                     }
-                    3 -> {
-                        Text("Select Payment Gateway", fontWeight = FontWeight.Bold, fontSize = 13.sp)
-                        Spacer(modifier = Modifier.height(12.dp))
-                        listOf("GCash", "Maya", "Credit Card", "Cash on Delivery").forEach { method ->
-                            val isSel = selectedPayment == method
-                            Surface(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { selectedPayment = method },
-                                shape = RoundedCornerShape(12.dp),
-                                color = if (isSel) PrimaryBlue.copy(0.1f) else AppLightBg,
-                                border = BorderStroke(1.dp, if (isSel) PrimaryBlue else Color.Transparent)
+                    Spacer(modifier = Modifier.width(14.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Professional Installation Included", fontWeight = FontWeight.Bold, color = TextDark, fontSize = 14.sp)
+                        Text("Your order is dispatched directly via Admin Operations. An expert technician will be assigned to handle delivery and setup.", fontSize = 11.sp, color = Color.Gray, lineHeight = 15.sp)
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // 🛒 1. ORDERED ITEMS REVIEW
+            Text("ORDERED PRODUCTS (${cart.sumOf { it.quantity }})", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Color.Gray, letterSpacing = 0.5.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+            ) {
+                Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    cart.forEach { item ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier.size(48.dp).clip(RoundedCornerShape(10.dp)).background(item.product.color),
+                                contentAlignment = Alignment.Center
                             ) {
-                                Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                                    RadioButton(selected = isSel, onClick = { selectedPayment = method }, colors = RadioButtonDefaults.colors(selectedColor = PrimaryBlue))
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(method, fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium)
+                                Icon(getProductIcon(item.product.name, item.product.category), null, tint = PrimaryBlue, modifier = Modifier.size(24.dp))
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(item.product.name, fontWeight = FontWeight.Bold, fontSize = 14.sp, color = TextDark)
+                                Text(item.product.category, fontSize = 11.sp, color = Color.Gray)
+                                Text(item.product.price, color = PrimaryBlue, fontWeight = FontWeight.Black, fontSize = 13.sp)
+                            }
+                            
+                            // Quantity Controls
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                IconButton(
+                                    onClick = { viewModel.updateQuantity(item.product.id, -1) },
+                                    modifier = Modifier.size(28.dp).background(AppLightBg, CircleShape)
+                                ) {
+                                    Icon(Icons.Default.Remove, null, tint = TextDark, modifier = Modifier.size(14.dp))
+                                }
+                                Text("${item.quantity}", fontWeight = FontWeight.Black, modifier = Modifier.padding(horizontal = 8.dp), fontSize = 14.sp)
+                                IconButton(
+                                    onClick = { viewModel.updateQuantity(item.product.id, 1) },
+                                    modifier = Modifier.size(28.dp).background(AppLightBg, CircleShape)
+                                ) {
+                                    Icon(Icons.Default.Add, null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
                                 }
                             }
                         }
                     }
                 }
             }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    if (step < 3) step++
-                    else {
-                        isProcessing = true
-                        viewModel.checkout(shippingAddress, selectedPayment) { result ->
-                            isProcessing = false
-                            result.onSuccess {
-                                Toast.makeText(context, "Order Placed Successfully!", Toast.LENGTH_LONG).show()
-                                onDismiss()
-                            }.onFailure {
-                                Toast.makeText(context, "Error: ${it.message}", Toast.LENGTH_LONG).show()
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // 📍 2. DELIVERY & INSTALLATION ADDRESS
+            Text("DELIVERY & INSTALLATION ADDRESS", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Color.Gray, letterSpacing = 0.5.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    OutlinedTextField(
+                        value = streetAddress,
+                        onValueChange = { streetAddress = it },
+                        label = { Text("House No. / Street Address") },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = city,
+                            onValueChange = { city = it },
+                            label = { Text("City") },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        OutlinedTextField(
+                            value = province,
+                            onValueChange = { province = it },
+                            label = { Text("Province") },
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = phone,
+                        onValueChange = { phone = it },
+                        label = { Text("Contact Phone Number") },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // 💳 3. PAYMENT METHOD SELECTION
+            Text("PAYMENT METHOD", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Color.Gray, letterSpacing = 0.5.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            listOf("QR Ph (GCash, Maya, InstaPay)", "GCash Direct", "Maya Direct", "Cash on Delivery").forEach { method ->
+                val isSel = selectedPaymentMethod == method
+                val isQr = method.startsWith("QR Ph")
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable { selectedPaymentMethod = method },
+                    shape = RoundedCornerShape(14.dp),
+                    color = if (isSel) PrimaryBlue.copy(0.08f) else Color.White,
+                    border = BorderStroke(1.dp, if (isSel) PrimaryBlue else Color(0xFFE2E8F0))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(
+                            selected = isSel, 
+                            onClick = { selectedPaymentMethod = method }, 
+                            colors = RadioButtonDefaults.colors(selectedColor = PrimaryBlue)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = method, 
+                                    fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium, 
+                                    color = TextDark, 
+                                    fontSize = 13.sp,
+                                    modifier = Modifier.weight(1f, fill = false)
+                                )
+                                if (isQr) {
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(6.dp), 
+                                        color = Color(0xFF0038A8).copy(0.12f)
+                                    ) {
+                                        Text(
+                                            text = "RECOMMENDED", 
+                                            color = Color(0xFF0038A8), 
+                                            fontSize = 8.sp, 
+                                            fontWeight = FontWeight.Black, 
+                                            maxLines = 1,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                        )
+                                    }
+                                }
+                            }
+                            if (isQr) {
+                                Text(
+                                    text = "Scan via GCash, Maya, or any Philippine banking app", 
+                                    fontSize = 10.sp, 
+                                    color = Color.Gray,
+                                    modifier = Modifier.padding(top = 2.dp)
+                                )
                             }
                         }
                     }
-                },
-                enabled = !isProcessing && (step != 2 || shippingAddress.isNotBlank()),
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // 💰 4. FINANCIAL BREAKDOWN
+            Text("BILLING BREAKDOWN", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Color.Gray, letterSpacing = 0.5.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(12.dp)
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
             ) {
-                if (isProcessing) CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
-                else Text(if (step < 3) "Next" else "Confirm & Pay", fontWeight = FontWeight.Bold)
+                Column(modifier = Modifier.padding(16.dp)) {
+                    CheckoutPriceRow("Items Subtotal", subtotal)
+                    CheckoutPriceRow("VAT (12%)", vat)
+                    CheckoutPriceRow("Delivery & Installation", 0.0)
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 10.dp), color = Color(0xFFF1F5F9))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Total Amount Due", fontWeight = FontWeight.Black, fontSize = 15.sp, color = TextDark)
+                        Text("₱${String.format(Locale.getDefault(), "%,.2f", total)}", fontWeight = FontWeight.Black, fontSize = 17.sp, color = PrimaryBlue)
+                    }
+                }
             }
-        },
-        dismissButton = {
-            TextButton(onClick = { if (step > 1) step-- else onDismiss() }) {
-                Text(if (step > 1) "Back" else "Cancel", color = Color.Gray)
-            }
-        },
-        shape = RoundedCornerShape(28.dp),
-        containerColor = Color.White
-    )
+
+            Spacer(modifier = Modifier.height(30.dp))
+        }
+    }
 }
 
 @Composable
@@ -1228,7 +1507,9 @@ fun getProductIcon(name: String, category: String): ImageVector {
 @Composable
 fun ProductDetailDialog(
     product: Product,
-    onDismiss: () -> Unit
+    viewModel: CustomerViewModel,
+    onDismiss: () -> Unit,
+    onProceedToCheckout: () -> Unit
 ) {
     val db = remember { FirebaseFirestore.getInstance() }
     val auth = remember { FirebaseAuth.getInstance() }
@@ -1237,7 +1518,7 @@ fun ProductDetailDialog(
     var customerName by remember { mutableStateOf("Customer") }
     var customerPhone by remember { mutableStateOf("") }
     var customerAddress by remember { mutableStateOf("") }
-    var isOrdering by remember { mutableStateOf(false) }
+    val isAvailable = product.stock > 0 && product.badge != "OUT OF STOCK"
 
     LaunchedEffect(Unit) {
         val uid = auth.currentUser?.uid
@@ -1262,12 +1543,26 @@ fun ProductDetailDialog(
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(120.dp)
+                        .height(180.dp)
                         .clip(RoundedCornerShape(16.dp))
                         .background(product.color),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Default.ShoppingCart, null, tint = PrimaryBlue, modifier = Modifier.size(52.dp))
+                    if (!product.imageUrl.isNullOrBlank()) {
+                        AsyncImage(
+                            model = product.imageUrl,
+                            contentDescription = product.name,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Icon(
+                            imageVector = getProductIcon(product.name, product.category),
+                            contentDescription = null,
+                            tint = PrimaryBlue,
+                            modifier = Modifier.size(52.dp)
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(14.dp))
@@ -1301,6 +1596,31 @@ fun ProductDetailDialog(
                     Text(product.warranty, fontSize = 11.sp, color = PrimaryGreen, fontWeight = FontWeight.Medium)
                 }
 
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Inventory Stock Status Indicator
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (isAvailable) PrimaryGreen.copy(0.1f) else Color.Red.copy(0.1f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = if (isAvailable) Icons.Default.CheckCircle else Icons.Default.Warning,
+                            contentDescription = null,
+                            tint = if (isAvailable) PrimaryGreen else Color.Red,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (isAvailable) "In Stock (${product.stock} units available)" else "Out of Stock - Restock Requested",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isAvailable) PrimaryGreen else Color.Red
+                        )
+                    }
+                }
+
                 Spacer(modifier = Modifier.height(14.dp))
                 HorizontalDivider(color = Color.LightGray.copy(alpha = 0.3f))
                 Spacer(modifier = Modifier.height(10.dp))
@@ -1310,58 +1630,35 @@ fun ProductDetailDialog(
             }
         },
         confirmButton = {
-            Button(
-                enabled = !isOrdering,
-                onClick = {
-                    if (customerAddress.isBlank()) {
-                        Toast.makeText(context, "Please set your address in Settings before buying!", Toast.LENGTH_LONG).show()
-                        return@Button
-                    }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        viewModel.addToCart(product)
+                        Toast.makeText(context, "${product.name} added to cart!", Toast.LENGTH_SHORT).show()
+                        onDismiss()
+                    },
+                    enabled = isAvailable,
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("Add to Cart", fontSize = 12.sp)
+                }
 
-                    val uid = auth.currentUser?.uid ?: return@Button
-                    isOrdering = true
-
-                    val serviceRequest = mapOf(
-                        "technician" to "Hardware Team / Installation",
-                        "status" to "pending",
-                        "timestamp" to com.google.firebase.Timestamp.now(),
-                        "issue" to "Hardware Order: ${product.name} (${product.price}) + Installation"
-                    )
-
-                    val chatUpdate = mapOf(
-                        "customerName" to customerName,
-                        "customerEmail" to (auth.currentUser?.email ?: ""),
-                        "customerPhone" to customerPhone,
-                        "customerAddress" to customerAddress,
-                        "status" to "Order & Installation Requested",
-                        "lastRequest" to product.name,
-                        "timestamp" to com.google.firebase.Timestamp.now()
-                    )
-
-                    db.collection("chats_v2").document("admin_$uid").set(chatUpdate, com.google.firebase.firestore.SetOptions.merge())
-                    db.collection("chats_v2").document("admin_$uid").collection("services").add(serviceRequest)
-
-                    val autoMsg = hashMapOf(
-                        "senderId" to uid,
-                        "senderName" to customerName,
-                        "text" to "I have placed an order for ${product.name} (${product.price}) with professional installation request.",
-                        "timestamp" to com.google.firebase.Timestamp.now()
-                    )
-                    db.collection("chats_v2").document("admin_$uid").collection("messages").add(autoMsg)
-
-                    Toast.makeText(context, "Order placed! Installation request sent to Admin.", Toast.LENGTH_LONG).show()
-                    isOrdering = false
-                    onDismiss()
-                },
-                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                if (isOrdering) CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
-                else Text("Buy & Book Installation", fontWeight = FontWeight.Bold)
+                Button(
+                    enabled = isAvailable,
+                    onClick = {
+                        viewModel.addToCart(product)
+                        onDismiss()
+                        onProceedToCheckout()
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text("Buy & Checkout", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Close", color = Color.Gray) }
+            TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
 }
@@ -1383,6 +1680,9 @@ fun TechnicianDirectoryView() {
 
     var isLoadingTechs by remember { mutableStateOf(true) }
     var selectedTechForSchedule by remember { mutableStateOf<String?>(null) }
+    var selectedTechForDetailView by remember { mutableStateOf<Map<String, Any>?>(null) }
+
+    var searchQuery by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         val uid = auth.currentUser?.uid
@@ -1425,16 +1725,19 @@ fun TechnicianDirectoryView() {
             technicians.clear()
             snapshot?.documents?.forEach { doc -> 
                 val tName = doc.getString("name") ?: "Unknown Tech"
+                val tUid = doc.id
                 val data = doc.data ?: emptyMap()
-                technicians.add(data + ("uid" to doc.id))
+                technicians.add(data + ("uid" to tUid))
 
-                // Fetch real-time global workload for this technician
-                db.collection("chats_v2")
-                    .whereEqualTo("assignedTechnician", tName)
+                // Fetch real-time active workload for this technician from service_requests
+                db.collection("service_requests")
                     .addSnapshotListener { jobsSnap, _ ->
                         val activeCount = jobsSnap?.documents?.count { 
+                            val docTechUid = it.getString("technicianUid")
+                            val docTechName = it.getString("technicianName") ?: it.getString("technician") ?: ""
+                            val matchesTech = (docTechUid != null && docTechUid == tUid) || docTechName.equals(tName, ignoreCase = true)
                             val st = it.getString("status") ?: ""
-                            st != "Completed" && st != "Denied" && st != "Request Cancelled"
+                            matchesTech && st != "Completed" && st != "Denied" && st != "Request Cancelled" && st != "Cancelled"
                         } ?: 0
                         techWorkloads[tName] = activeCount
                     }
@@ -1443,9 +1746,175 @@ fun TechnicianDirectoryView() {
         }
     }
 
+    val filteredTechs = technicians.filter { techData ->
+        val name = techData["name"]?.toString() ?: ""
+        val skill = techData["skill"]?.toString() ?: ""
+        searchQuery.isBlank() || name.contains(searchQuery, ignoreCase = true) || skill.contains(searchQuery, ignoreCase = true)
+    }
+
+    if (selectedTechForDetailView != null) {
+        val techData = selectedTechForDetailView!!
+        val tName = techData["name"]?.toString() ?: "Specialist"
+        val tPic = techData["profilePicUrl"]?.toString()
+        val tSkill = techData["skill"]?.toString() ?: "HVAC & AC Master"
+        val tPhone = techData["phone"]?.toString() ?: "Available via chat"
+        val tEmail = techData["email"]?.toString() ?: ""
+        val isVerified = techData["isVerified"] == true
+        val ratingData = techRatings[tName]
+        val activeJobs = techWorkloads[tName] ?: 0
+
+        AlertDialog(
+            onDismissRequest = { selectedTechForDetailView = null },
+            title = null,
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Box(modifier = Modifier.padding(top = 8.dp)) {
+                        if (tPic != null) {
+                            AsyncImage(
+                                model = tPic,
+                                contentDescription = tName,
+                                modifier = Modifier
+                                    .size(110.dp)
+                                    .clip(CircleShape)
+                                    .border(3.dp, PrimaryBlue, CircleShape),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Box(
+                                modifier = Modifier
+                                    .size(110.dp)
+                                    .background(PrimaryBlue.copy(0.12f), CircleShape)
+                                    .border(3.dp, PrimaryBlue, CircleShape),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(Icons.Default.AccountCircle, null, modifier = Modifier.size(80.dp), tint = PrimaryBlue)
+                            }
+                        }
+
+                        if (isVerified) {
+                            Box(
+                                modifier = Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .background(PrimaryGreen, CircleShape)
+                                    .padding(4.dp)
+                            ) {
+                                Icon(Icons.Default.Verified, "Verified", tint = Color.White, modifier = Modifier.size(20.dp))
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(tName, fontWeight = FontWeight.Black, fontSize = 20.sp, color = TextDark)
+                    
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = PrimaryBlue.copy(0.1f),
+                        modifier = Modifier.padding(top = 4.dp)
+                    ) {
+                        Text(tSkill, color = PrimaryBlue, fontWeight = FontWeight.Bold, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+                    HorizontalDivider(color = Color(0xFFF1F5F9))
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("RATING", fontSize = 10.sp, fontWeight = FontWeight.Black, color = Color.Gray)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Star, null, tint = Color(0xFFFFB300), modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(2.dp))
+                                Text(
+                                    text = if (ratingData != null) String.format(Locale.getDefault(), "%.1f (%d)", ratingData.first, ratingData.second) else "5.0 (New)",
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 14.sp,
+                                    color = TextDark
+                                )
+                            }
+                        }
+
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("STATUS", fontSize = 10.sp, fontWeight = FontWeight.Black, color = Color.Gray)
+                            Text(
+                                text = if (activeJobs == 0) "Ready" else "Busy ($activeJobs)",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp,
+                                color = if (activeJobs == 0) PrimaryGreen else Color.Red
+                            )
+                        }
+
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("BADGE", fontSize = 10.sp, fontWeight = FontWeight.Black, color = Color.Gray)
+                            Text("Verified Pro", fontWeight = FontWeight.Bold, fontSize = 14.sp, color = PrimaryBlue)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    HorizontalDivider(color = Color(0xFFF1F5F9))
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Phone, null, tint = Color.Gray, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text("Phone: $tPhone", fontSize = 12.sp, color = TextDark)
+                        }
+                        if (tEmail.isNotBlank()) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(Icons.Default.Email, null, tint = Color.Gray, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text("Email: $tEmail", fontSize = 12.sp, color = TextDark)
+                            }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Build, null, tint = Color.Gray, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text("Equipment: Multi-Brand HVAC Tools & Gauges", fontSize = 12.sp, color = TextDark)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(20.dp))
+
+                    Button(
+                        onClick = {
+                            if (customerName == "No Name Set" || customerAddress == "No Address Set") {
+                                Toast.makeText(context, "Please set your details in Settings first!", Toast.LENGTH_LONG).show()
+                            } else {
+                                selectedTechForSchedule = tName
+                                selectedTechForDetailView = null
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth().height(48.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
+                    ) {
+                        Icon(Icons.Default.CalendarMonth, null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Schedule Appointment", fontWeight = FontWeight.Bold)
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { selectedTechForDetailView = null }) { Text("Close", color = Color.Gray) }
+            },
+            shape = RoundedCornerShape(24.dp),
+            containerColor = Color.White
+        )
+    }
+
     if (selectedTechForSchedule != null) {
+        val techData = technicians.find { it["name"] == selectedTechForSchedule }
         AppointmentSchedulerDialog(
             techName = selectedTechForSchedule!!,
+            techPic = techData?.get("profilePicUrl")?.toString(),
+            techSkill = techData?.get("skill")?.toString() ?: "HVAC Specialist",
             customerName = customerName,
             customerPhone = customerPhone,
             customerAddress = customerAddress,
@@ -1454,110 +1923,242 @@ fun TechnicianDirectoryView() {
     }
 
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Hire a Professional Specialist", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold), color = TextDark)
-        Spacer(modifier = Modifier.height(16.dp))
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Text("Select Field Specialist", style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Black), color = TextDark)
+            Text("Browse verified technicians with authentic profiles & ratings", fontSize = 12.sp, color = Color.Gray)
+        }
+
+        Spacer(modifier = Modifier.height(14.dp))
+
+        // Search Bar
+        OutlinedTextField(
+            value = searchQuery,
+            onValueChange = { searchQuery = it },
+            placeholder = { Text("Search technician by name or skill...", fontSize = 13.sp, color = Color.Gray) },
+            leadingIcon = { Icon(Icons.Default.Search, null, tint = PrimaryBlue, modifier = Modifier.size(20.dp)) },
+            modifier = Modifier.fillMaxWidth().height(52.dp),
+            shape = RoundedCornerShape(14.dp),
+            singleLine = true,
+            textStyle = TextStyle(fontSize = 13.sp, color = TextDark)
+        )
+
+        Spacer(modifier = Modifier.height(14.dp))
 
         if (isLoadingTechs) {
             ShimmerCardList(count = 4)
-        } else if (technicians.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No technicians available right now.", color = Color.Gray)
+        } else if (filteredTechs.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize().weight(1f), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.Person, null, tint = Color.LightGray, modifier = Modifier.size(48.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("No matching technicians found.", color = Color.Gray, fontWeight = FontWeight.Medium)
+                }
             }
         } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(technicians) { techData ->
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                items(filteredTechs) { techData ->
                     val tech = techData["name"]?.toString() ?: "Unknown"
                     val techPic = techData["profilePicUrl"]?.toString()
+                    val skill = techData["skill"]?.toString() ?: "HVAC & AC Master"
+                    val isVerified = techData["isVerified"] == true
                     val status = techStatuses[tech] ?: "none"
                     val workload = techWorkloads[tech] ?: 0
 
-                    // A tech is interactable if they are free (workload == 0) OR if the current user already has an active request with them
                     val isFree = workload == 0
                     val isMyTech = status != "none" && status != "denied" && status != "cancelled" && !status.equals("completed", ignoreCase = true)
-
                     val isInteractable = isFree || isMyTech
 
                     val ratingData = techRatings[tech]
                     val ratingText = if (ratingData != null) {
                         String.format(Locale.getDefault(), "%.1f ★ (%d reviews)", ratingData.first, ratingData.second)
                     } else {
-                        "5.0 ★ (New Expert)"
+                        "5.0 ★ (New Specialist)"
                     }
 
-                    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)) {
-                        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            if (techPic != null) {
-                                AsyncImage(
-                                    model = techPic,
-                                    contentDescription = tech,
-                                    modifier = Modifier.size(48.dp).clip(CircleShape),
-                                    contentScale = ContentScale.Crop
-                                )
-                            } else {
-                                Icon(Icons.Default.AccountCircle, null, modifier = Modifier.size(48.dp), tint = PrimaryBlue)
-                            }
-                            Spacer(modifier = Modifier.width(14.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(tech, fontWeight = FontWeight.Bold, color = TextDark)
-                                    if (techData["isVerified"] == true) {
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Icon(Icons.Default.Verified, "Verified", tint = PrimaryGreen, modifier = Modifier.size(16.dp))
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { selectedTechForDetailView = techData },
+                        shape = RoundedCornerShape(20.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                        border = BorderStroke(1.dp, Color(0xFFF1F5F9))
+                    ) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                // High quality Avatar with Picture and Status Ring
+                                Box {
+                                    if (techPic != null) {
+                                        AsyncImage(
+                                            model = techPic,
+                                            contentDescription = tech,
+                                            modifier = Modifier
+                                                .size(68.dp)
+                                                .clip(CircleShape)
+                                                .border(
+                                                    BorderStroke(
+                                                        2.5.dp,
+                                                        if (isFree) PrimaryGreen else Color(0xFFFFB300)
+                                                    ),
+                                                    CircleShape
+                                                ),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    } else {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(68.dp)
+                                                .background(PrimaryBlue.copy(0.12f), CircleShape)
+                                                .border(
+                                                    BorderStroke(
+                                                        2.5.dp,
+                                                        if (isFree) PrimaryGreen else Color(0xFFFFB300)
+                                                    ),
+                                                    CircleShape
+                                                ),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            Icon(Icons.Default.AccountCircle, null, modifier = Modifier.size(52.dp), tint = PrimaryBlue)
+                                        }
                                     }
-                                }
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Star, null, tint = Color(0xFFFFB300), modifier = Modifier.size(14.dp))
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(ratingText, color = Color(0xFFFFB300), fontSize = 12.sp, fontWeight = FontWeight.Bold)
-                                }
-                                if (!isFree && !isMyTech) {
-                                    Text("Currently Busy", color = Color.Red, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                }
-                            }
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Button(
-                                    enabled = isInteractable && (isFree || isMyTech),
-                                    onClick = {
-                                        if (customerName == "No Name Set" || customerAddress == "No Address Set") {
-                                            Toast.makeText(context, "Please set your details in Settings first!", Toast.LENGTH_LONG).show()
-                                        } else {
-                                            selectedTechForSchedule = tech
-                                        }
-                                    },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = when (status.lowercase()) {
-                                            "pending" -> Color.Gray
-                                            "accepted" -> PrimaryGreen
-                                            "denied" -> Color.Red
-                                            else -> PrimaryBlue
-                                        }
-                                    ),
-                                    shape = RoundedCornerShape(10.dp)
-                                ) {
-                                    Text(
-                                        text = when (status.lowercase()) {
-                                            "pending" -> "Requested"
-                                            "accepted" -> "Accepted"
-                                            "denied" -> "Denied"
-                                            else -> "Schedule"
-                                        },
-                                        color = Color.White,
-                                        fontSize = 12.sp
+
+                                    // Online Status Indicator Dot
+                                    Box(
+                                        modifier = Modifier
+                                            .size(14.dp)
+                                            .align(Alignment.BottomEnd)
+                                            .background(if (isFree) PrimaryGreen else Color(0xFFFFB300), CircleShape)
+                                            .border(2.dp, Color.White, CircleShape)
                                     )
                                 }
 
-                                if (status == "pending") {
+                                Spacer(modifier = Modifier.width(14.dp))
+
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(tech, fontWeight = FontWeight.Black, fontSize = 16.sp, color = TextDark)
+                                        if (isVerified) {
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Icon(Icons.Default.Verified, "Verified Specialist", tint = PrimaryGreen, modifier = Modifier.size(16.dp))
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(2.dp))
+
+                                    // Specialization Skill Pill Badge
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = PrimaryBlue.copy(0.08f)
+                                    ) {
+                                        Text(
+                                            text = skill,
+                                            color = PrimaryBlue,
+                                            fontWeight = FontWeight.Bold,
+                                            fontSize = 11.sp,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(4.dp))
+
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.Star, null, tint = Color(0xFFFFB300), modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(ratingText, color = Color(0xFFFFB300), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+                            HorizontalDivider(color = Color(0xFFF8FAFC))
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Surface(
+                                        shape = CircleShape,
+                                        color = if (isFree) PrimaryGreen.copy(0.12f) else Color(0xFFFFF3E0)
+                                    ) {
+                                        Text(
+                                            text = if (isFree) " Ready to Dispatch" else " In Service ($workload active)",
+                                            color = if (isFree) PrimaryGreen else Color(0xFFE65100),
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                        )
+                                    }
+                                }
+
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    OutlinedButton(
+                                        onClick = { selectedTechForDetailView = techData },
+                                        shape = RoundedCornerShape(10.dp),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(34.dp),
+                                        border = BorderStroke(1.dp, Color(0xFFCBD5E1))
+                                    ) {
+                                        Text("Profile", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = TextDark)
+                                    }
+
+                                    Button(
+                                        enabled = isInteractable && (isFree || isMyTech),
+                                        onClick = {
+                                            if (customerName == "No Name Set" || customerAddress == "No Address Set") {
+                                                Toast.makeText(context, "Please set your details in Settings first!", Toast.LENGTH_LONG).show()
+                                            } else {
+                                                selectedTechForSchedule = tech
+                                            }
+                                        },
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = when (status.lowercase()) {
+                                                "pending" -> Color.Gray
+                                                "accepted" -> PrimaryGreen
+                                                "denied" -> Color.Red
+                                                else -> PrimaryBlue
+                                            }
+                                        ),
+                                        shape = RoundedCornerShape(10.dp),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                                        modifier = Modifier.height(34.dp)
+                                    ) {
+                                        Icon(Icons.Default.CalendarMonth, null, modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Text(
+                                            text = when (status.lowercase()) {
+                                                "pending" -> "Requested"
+                                                "accepted" -> "Accepted"
+                                                "denied" -> "Denied"
+                                                else -> "Book Now"
+                                            },
+                                            color = Color.White,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (status.lowercase() == "pending" || status.lowercase() == "accepted" || status.lowercase().contains("accepted")) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                                     TextButton(
                                         onClick = {
                                             val uid = auth.currentUser?.uid ?: ""
-                                            db.collection("chats_v2").document("admin_$uid").collection("services")
-                                                .whereEqualTo("technician", tech)
-                                                .whereEqualTo("status", "pending")
+                                            db.collection("service_requests")
+                                                .whereEqualTo("customerUid", uid)
                                                 .get().addOnSuccessListener { snapshot ->
-                                                    snapshot.documents.forEach { doc -> doc.reference.update("status", "cancelled") }
+                                                    snapshot.documents.forEach { doc -> 
+                                                        val st = doc.getString("status")?.lowercase() ?: ""
+                                                        val docTech = doc.getString("technicianName") ?: doc.getString("technician") ?: ""
+                                                        if ((st == "pending" || st == "accepted" || st.contains("accepted")) && (tech.isBlank() || docTech.equals(tech, ignoreCase = true))) {
+                                                            doc.reference.update(mapOf("status" to "cancelled", "updatedAt" to com.google.firebase.Timestamp.now())) 
+                                                        }
+                                                    }
                                                 }
-
-                                            db.collection("chats_v2").document("admin_$uid").update(mapOf("status" to "Request Cancelled"))
 
                                             db.collection("chats_v2").document("admin_$uid").collection("messages").add(hashMapOf(
                                                 "senderId" to uid,
@@ -1569,7 +2170,7 @@ fun TechnicianDirectoryView() {
                                             Toast.makeText(context, "Request cancelled", Toast.LENGTH_SHORT).show()
                                         }
                                     ) {
-                                        Text("Cancel", color = Color.Red, fontSize = 11.sp)
+                                        Text("Cancel Active Booking", color = Color.Red, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                                     }
                                 }
                             }
@@ -1581,10 +2182,12 @@ fun TechnicianDirectoryView() {
     }
 }
 
-// 📅 APPOINTMENT SCHEDULER DIALOG
+// 📅 EVENT CALENDAR & TIME PICKER APPOINTMENT SCHEDULER
 @Composable
 fun AppointmentSchedulerDialog(
     techName: String,
+    techPic: String? = null,
+    techSkill: String = "HVAC Specialist",
     customerName: String,
     customerPhone: String,
     customerAddress: String,
@@ -1594,147 +2197,438 @@ fun AppointmentSchedulerDialog(
     val auth = remember { FirebaseAuth.getInstance() }
     val context = LocalContext.current
 
-    // Data class to hold both the display label and the actual date
-    data class DateOption(val label: String, val calendar: Calendar)
+    val bookingsState = remember { mutableStateListOf<ScheduleManager.ServiceBooking>() }
+    val timeOffState = remember { mutableStateListOf<ScheduleManager.TimeOffBlock>() }
 
-    val dates = remember {
-        val list = mutableListOf<DateOption>()
-        val sdf = SimpleDateFormat("E, MMM d", Locale.getDefault())
-        for (i in 0..3) {
-            val cal = Calendar.getInstance()
-            cal.add(Calendar.DAY_OF_YEAR, i)
-            val prefix = when (i) {
-                0 -> "Today"
-                1 -> "Tomorrow"
-                else -> sdf.format(cal.time)
+    // Fetch live bookings & time off blocks
+    DisposableEffect(techName) {
+        val listenerGroup = db.collection("service_requests")
+            .addSnapshotListener { snapshot, _ ->
+                bookingsState.clear()
+                snapshot?.documents?.forEach { doc ->
+                    val status = doc.getString("status") ?: "Pending"
+                    val startTime = (doc.get("startTimeMillis") as? Number)?.toLong()
+                        ?: doc.getTimestamp("scheduledStart")?.toDate()?.time
+                        ?: doc.getTimestamp("scheduledTimestamp")?.toDate()?.time ?: 0L
+                    val duration = (doc.get("durationMinutes") as? Number)?.toInt() ?: ScheduleManager.DEFAULT_SERVICE_DURATION_MINUTES
+                    val buffer = (doc.get("bufferMinutes") as? Number)?.toInt() ?: ScheduleManager.DEFAULT_BUFFER_MINUTES
+                    val endTime = (doc.get("endTimeMillis") as? Number)?.toLong()
+                        ?: doc.getTimestamp("scheduledEnd")?.toDate()?.time
+                        ?: if (startTime > 0) startTime + (duration * 60 * 1000L) else 0L
+
+                    bookingsState.add(
+                        ScheduleManager.ServiceBooking(
+                            id = doc.id,
+                            customerUid = doc.getString("customerUid") ?: "",
+                            customerName = doc.getString("customerName") ?: "Customer",
+                            technicianUid = doc.getString("technicianUid"),
+                            technicianName = doc.getString("technicianName") ?: doc.getString("technician") ?: doc.getString("assignedTechnician") ?: "",
+                            serviceType = doc.getString("issue") ?: "HVAC Service",
+                            status = status,
+                            startTimeMillis = startTime,
+                            endTimeMillis = endTime,
+                            durationMinutes = duration,
+                            bufferMinutes = buffer,
+                            createdAtMillis = (doc.get("createdAtMillis") as? Number)?.toLong()
+                                ?: doc.getTimestamp("createdAt")?.toDate()?.time ?: System.currentTimeMillis()
+                        )
+                    )
+                }
             }
-            val formatted = if (i <= 1) "$prefix (${sdf.format(cal.time)})" else prefix
-            list.add(DateOption(formatted, cal))
+
+        val timeOffListener = db.collection("time_off_blocks")
+            .addSnapshotListener { snapshot, _ ->
+                timeOffState.clear()
+                snapshot?.documents?.forEach { doc ->
+                    timeOffState.add(
+                        ScheduleManager.TimeOffBlock(
+                            id = doc.id,
+                            technicianName = doc.getString("technicianName") ?: "",
+                            startTimeMillis = (doc.get("startTimeMillis") as? Number)?.toLong() ?: 0L,
+                            endTimeMillis = (doc.get("endTimeMillis") as? Number)?.toLong() ?: 0L,
+                            reason = doc.getString("reason") ?: "Time Off"
+                        )
+                    )
+                }
+            }
+
+        onDispose {
+            listenerGroup.remove()
+            timeOffListener.remove()
         }
-        list
     }
 
-    val timeSlots = listOf(
-        "08:00 AM - 10:00 AM",
-        "10:00 AM - 12:00 PM",
-        "01:00 PM - 03:00 PM",
-        "03:00 PM - 05:00 PM"
-    )
+    // Calendar & Event Time Picker state
+    val todayCal = remember { Calendar.getInstance() }
+    val selectedCalendar = remember {
+        mutableStateOf(
+            Calendar.getInstance().apply {
+                add(Calendar.DAY_OF_MONTH, 1) // Default to tomorrow
+            }
+        )
+    }
 
-    var selectedDateOption by remember { mutableStateOf(dates[1]) }
-    var selectedSlot by remember { mutableStateOf(timeSlots[1]) }
+    val displayMonthCalendar = remember {
+        mutableStateOf(
+            Calendar.getInstance().apply {
+                set(Calendar.DAY_OF_MONTH, 1)
+            }
+        )
+    }
+
+    // Calculate dynamic slots for selected calendar date
+    val dynamicSlots = remember(selectedCalendar.value, bookingsState, timeOffState) {
+        ScheduleManager.getDailySlotsForTechnician(
+            targetCalendar = selectedCalendar.value,
+            technicianConfig = ScheduleManager.TechnicianScheduleConfig(technicianName = techName),
+            bookings = bookingsState,
+            timeOffBlocks = timeOffState
+        )
+    }
+
+    var selectedSlotObj by remember { mutableStateOf<ScheduleManager.TimeSlot?>(null) }
+    LaunchedEffect(dynamicSlots) {
+        selectedSlotObj = dynamicSlots.firstOrNull { it.isAvailable } ?: dynamicSlots.firstOrNull()
+    }
+
+    var issueNote by remember { mutableStateOf("") }
     var isBooking by remember { mutableStateOf(false) }
-    var isAnalyzingSound by remember { mutableStateOf(false) }
-    var aiDiagnosticResult by remember { mutableStateOf<String?>(null) }
 
-    if (isAnalyzingSound) {
-        LaunchedEffect(Unit) {
-            kotlinx.coroutines.delay(3000)
-            aiDiagnosticResult = "🔍 AI Analysis (Sound ID): Unit sounds stable but requires routine maintenance. No critical component failure detected."
-            isAnalyzingSound = false
-        }
-    }
+    val quickIssueTags = listOf("AC Cleaning", "Unit Not Cooling", "Freon Refill", "Leak Repair", "Noise Check")
+
+    // Helper to format date label
+    val fullDateFormatter = remember { SimpleDateFormat("EEEE, MMMM d, yyyy", Locale.getDefault()) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Schedule Appointment", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = TextDark) },
+        title = null,
         text = {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
             ) {
-                Text("Select preferred date and time for $techName", fontSize = 12.sp, color = Color.Gray)
-                Spacer(modifier = Modifier.height(14.dp))
-
-                // ✨ AI SOUND TRIAGE SECTION
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                    colors = CardDefaults.cardColors(containerColor = PrimaryBlue.copy(0.05f)),
-                    border = BorderStroke(1.dp, PrimaryBlue.copy(0.2f))
+                // Header with Technician Card
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = AppLightBg,
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 14.dp)
                 ) {
-                    Column(modifier = Modifier.padding(12.dp)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.AutoAwesome, null, tint = PrimaryBlue, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Smart AI Diagnostic (Optional)", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = PrimaryBlue)
-                        }
-                        Text("Analyze unit sounds to help technician prepare.", fontSize = 11.sp, color = Color.Gray)
-                        Spacer(modifier = Modifier.height(10.dp))
-                        
-                        if (aiDiagnosticResult == null) {
-                            Button(
-                                onClick = { isAnalyzingSound = true },
-                                enabled = !isAnalyzingSound,
-                                modifier = Modifier.fillMaxWidth().height(36.dp),
-                                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                                shape = RoundedCornerShape(8.dp)
-                            ) {
-                                if (isAnalyzingSound) {
-                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White, strokeWidth = 2.dp)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Analyzing...", fontSize = 11.sp)
-                                } else {
-                                    Icon(Icons.Default.Mic, null, modifier = Modifier.size(14.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text("Start Sound Analysis", fontSize = 11.sp)
-                                }
-                            }
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (techPic != null) {
+                            AsyncImage(
+                                model = techPic,
+                                contentDescription = techName,
+                                modifier = Modifier.size(50.dp).clip(CircleShape),
+                                contentScale = ContentScale.Crop
+                            )
                         } else {
-                            Surface(
-                                color = Color.White,
-                                shape = RoundedCornerShape(8.dp),
-                                border = BorderStroke(1.dp, PrimaryBlue.copy(0.1f))
+                            Box(
+                                modifier = Modifier.size(50.dp).background(PrimaryBlue.copy(0.12f), CircleShape),
+                                contentAlignment = Alignment.Center
                             ) {
+                                Icon(Icons.Default.AccountCircle, null, tint = PrimaryBlue, modifier = Modifier.size(36.dp))
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.width(12.dp))
+
+                        Column {
+                            Text(techName, fontWeight = FontWeight.Black, fontSize = 16.sp, color = TextDark)
+                            Text(techSkill, fontSize = 12.sp, color = Color.Gray, fontWeight = FontWeight.Medium)
+                            Text("📍 Address: ${customerAddress.ifBlank { "On Profile" }}", fontSize = 10.sp, color = PrimaryBlue, maxLines = 1)
+                        }
+                    }
+                }
+
+                // ✨ 1. INTERACTIVE MONTH EVENT CALENDAR PICKER
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White),
+                    border = BorderStroke(1.dp, Color(0xFFE2E8F0)),
+                    elevation = CardDefaults.cardElevation(1.dp)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        // Month & Year Header Navigation
+                        val currentMonthCal = displayMonthCalendar.value
+                        val monthYearTitle = remember(currentMonthCal.timeInMillis) {
+                            SimpleDateFormat("MMMM yyyy", Locale.getDefault()).format(currentMonthCal.time)
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            IconButton(
+                                onClick = {
+                                    val newCal = currentMonthCal.clone() as Calendar
+                                    newCal.add(Calendar.MONTH, -1)
+                                    val minMonth = todayCal.clone() as Calendar
+                                    minMonth.set(Calendar.DAY_OF_MONTH, 1)
+                                    if (!newCal.before(minMonth)) {
+                                        displayMonthCalendar.value = newCal
+                                    }
+                                }
+                            ) {
+                                Icon(Icons.AutoMirrored.Filled.ArrowBack, "Prev Month", tint = TextDark, modifier = Modifier.size(20.dp))
+                            }
+
+                            Text(monthYearTitle, fontWeight = FontWeight.Black, fontSize = 15.sp, color = TextDark)
+
+                            IconButton(
+                                onClick = {
+                                    val newCal = currentMonthCal.clone() as Calendar
+                                    newCal.add(Calendar.MONTH, 1)
+                                    displayMonthCalendar.value = newCal
+                                }
+                            ) {
+                                Icon(Icons.Default.ChevronRight, "Next Month", tint = TextDark, modifier = Modifier.size(24.dp))
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        // Days of Week Header
+                        val daysOfWeek = listOf("SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT")
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            daysOfWeek.forEach { dayName ->
                                 Text(
-                                    aiDiagnosticResult!!,
-                                    modifier = Modifier.padding(8.dp),
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = TextDark,
-                                    lineHeight = 15.sp
+                                    text = dayName,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Black,
+                                    color = Color.Gray,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.weight(1f)
                                 )
                             }
                         }
-                    }
-                }
 
-                Text("Select Date:", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
-                Spacer(modifier = Modifier.height(6.dp))
+                        Spacer(modifier = Modifier.height(8.dp))
 
-                dates.forEach { option ->
-                    val isSel = selectedDateOption == option
-                    Surface(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable { selectedDateOption = option },
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (isSel) PrimaryBlue.copy(0.12f) else AppLightBg,
-                        border = BorderStroke(1.dp, if (isSel) PrimaryBlue else FieldBorder)
-                    ) {
-                        Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            RadioButton(selected = isSel, onClick = { selectedDateOption = option }, colors = RadioButtonDefaults.colors(selectedColor = PrimaryBlue))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(option.label, fontSize = 12.sp, fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium, color = if (isSel) PrimaryBlue else TextDark)
+                        // Days Grid Logic
+                        val year = currentMonthCal.get(Calendar.YEAR)
+                        val month = currentMonthCal.get(Calendar.MONTH)
+                        
+                        val tempCal = currentMonthCal.clone() as Calendar
+                        tempCal.set(Calendar.DAY_OF_MONTH, 1)
+                        val firstDayOfWeek = tempCal.get(Calendar.DAY_OF_WEEK)
+                        val maxDaysInMonth = tempCal.getActualMaximum(Calendar.DAY_OF_MONTH)
+
+                        val offsetCount = firstDayOfWeek - 1
+                        val totalCells = offsetCount + maxDaysInMonth
+                        val numRows = (totalCells + 6) / 7
+
+                        val selCal = selectedCalendar.value
+                        val selYear = selCal.get(Calendar.YEAR)
+                        val selMonth = selCal.get(Calendar.MONTH)
+                        val selDay = selCal.get(Calendar.DAY_OF_MONTH)
+
+                        val todYear = todayCal.get(Calendar.YEAR)
+                        val todMonth = todayCal.get(Calendar.MONTH)
+                        val todDay = todayCal.get(Calendar.DAY_OF_MONTH)
+
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            for (rowIndex in 0 until numRows) {
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceEvenly
+                                ) {
+                                    for (colIndex in 0 until 7) {
+                                        val cellIndex = rowIndex * 7 + colIndex
+                                        val dayNumber = cellIndex - offsetCount + 1
+
+                                        if (dayNumber in 1..maxDaysInMonth) {
+                                            val isPast = (year < todYear) ||
+                                                    (year == todYear && month < todMonth) ||
+                                                    (year == todYear && month == todMonth && dayNumber < todDay)
+
+                                            val isToday = (year == todYear && month == todMonth && dayNumber == todDay)
+                                            val isSelected = (year == selYear && month == selMonth && dayNumber == selDay)
+
+                                            val dayCal = Calendar.getInstance().apply { set(year, month, dayNumber) }
+                                            val isDayAvailable = remember(dayNumber, month, year, bookingsState.size, timeOffState.size) {
+                                                ScheduleManager.isDateAvailable(
+                                                    targetCalendar = dayCal,
+                                                    allTechConfigs = listOf(ScheduleManager.TechnicianScheduleConfig(technicianName = techName)),
+                                                    selectedTechName = techName,
+                                                    bookings = bookingsState,
+                                                    timeOffBlocks = timeOffState
+                                                )
+                                            }
+
+                                            Box(
+                                                modifier = Modifier
+                                                    .weight(1f)
+                                                    .aspectRatio(1f)
+                                                    .padding(2.dp)
+                                                    .clip(CircleShape)
+                                                    .background(
+                                                        when {
+                                                            isSelected -> PrimaryBlue
+                                                            isToday -> PrimaryGreen.copy(0.12f)
+                                                            !isDayAvailable && !isPast -> Color(0xFFFEE2E2) // Red tint for fully booked
+                                                            else -> Color.Transparent
+                                                        }
+                                                    )
+                                                    .border(
+                                                        BorderStroke(
+                                                            width = if (isToday && !isSelected) 1.5.dp else 0.dp,
+                                                            color = if (isToday && !isSelected) PrimaryGreen else Color.Transparent
+                                                        ),
+                                                        CircleShape
+                                                    )
+                                                    .clickable(enabled = !isPast) {
+                                                        val updated = Calendar.getInstance()
+                                                        updated.set(year, month, dayNumber)
+                                                        selectedCalendar.value = updated
+                                                    },
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                    Text(
+                                                        text = "$dayNumber",
+                                                        fontSize = 11.sp,
+                                                        fontWeight = if (isSelected || isToday) FontWeight.Black else FontWeight.Medium,
+                                                        color = when {
+                                                            isSelected -> Color.White
+                                                            isPast -> Color.LightGray
+                                                            !isDayAvailable -> Color.Red
+                                                            isToday -> PrimaryGreen
+                                                            else -> TextDark
+                                                        }
+                                                    )
+                                                    if (!isDayAvailable && !isPast && !isSelected) {
+                                                        Text("FULL", fontSize = 7.sp, fontWeight = FontWeight.Bold, color = Color.Red)
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            Spacer(modifier = Modifier.weight(1f))
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
                 Spacer(modifier = Modifier.height(14.dp))
 
-                Text("Select Time Slot:", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                // ✨ 2. REAL-TIME ACCURATE TIME SLOTS
+                Text("Select Available Time Slot (30m buffer included):", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
                 Spacer(modifier = Modifier.height(6.dp))
 
-                timeSlots.forEach { slot ->
-                    val isSel = selectedSlot == slot
-                    Surface(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable { selectedSlot = slot },
-                        shape = RoundedCornerShape(10.dp),
-                        color = if (isSel) PrimaryGreen.copy(0.12f) else AppLightBg,
-                        border = BorderStroke(1.dp, if (isSel) PrimaryGreen else FieldBorder)
-                    ) {
-                        Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Icon(Icons.Default.Schedule, null, tint = if (isSel) PrimaryGreen else Color.Gray, modifier = Modifier.size(18.dp))
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Text(slot, fontSize = 12.sp, fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium, color = if (isSel) PrimaryGreen else TextDark)
+                if (dynamicSlots.isEmpty()) {
+                    Text("No working hours or available slots on this day.", fontSize = 12.sp, color = Color.Red, modifier = Modifier.padding(vertical = 8.dp))
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        dynamicSlots.forEach { slot ->
+                            val isSel = selectedSlotObj?.startTimeMillis == slot.startTimeMillis
+                            Surface(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = slot.isAvailable) { selectedSlotObj = slot },
+                                shape = RoundedCornerShape(12.dp),
+                                color = when {
+                                    isSel -> PrimaryGreen.copy(0.15f)
+                                    !slot.isAvailable -> Color(0xFFF1F5F9)
+                                    else -> AppLightBg
+                                },
+                                border = BorderStroke(
+                                    width = if (isSel) 2.dp else 1.dp,
+                                    color = when {
+                                        isSel -> PrimaryGreen
+                                        !slot.isAvailable -> Color.LightGray
+                                        else -> FieldBorder
+                                    }
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(
+                                            Icons.Default.Schedule,
+                                            null,
+                                            tint = if (slot.isAvailable) PrimaryGreen else Color.Gray,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(10.dp))
+                                        Text(
+                                            slot.formattedTimeRange,
+                                            fontSize = 12.sp,
+                                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                                            color = if (slot.isAvailable) TextDark else Color.Gray
+                                        )
+                                    }
+
+                                    Text(
+                                        text = if (slot.isAvailable) "Available" else (slot.blockedReason ?: "Unavailable"),
+                                        fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (slot.isAvailable) PrimaryGreen else Color.Red
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // ✨ 3. SERVICE REASON / ISSUE INPUT
+                Text("Describe HVAC Issue or Service:", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                Spacer(modifier = Modifier.height(6.dp))
+
+                OutlinedTextField(
+                    value = issueNote,
+                    onValueChange = { issueNote = it },
+                    placeholder = { Text("e.g. AC Cleaning & Maintenance, Leaking Water...", fontSize = 12.sp, color = Color.Gray) },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    textStyle = TextStyle(fontSize = 12.sp, color = TextDark)
+                )
+
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // Quick issue tag chips
+                LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    items(quickIssueTags) { tag ->
+                        Surface(
+                            modifier = Modifier.clickable { issueNote = tag },
+                            shape = RoundedCornerShape(8.dp),
+                            color = PrimaryBlue.copy(0.08f)
+                        ) {
+                            Text(tag, fontSize = 10.sp, fontWeight = FontWeight.Bold, color = PrimaryBlue, modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp))
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // ✨ BOOKING SUMMARY BANNER
+                val formattedDateStr = remember(selectedCalendar.value) { fullDateFormatter.format(selectedCalendar.value.time) }
+                val slotLabel = selectedSlotObj?.formattedTimeRange ?: "No slot selected"
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = CardDefaults.cardColors(containerColor = PrimaryGreen.copy(0.08f)),
+                    border = BorderStroke(1.dp, PrimaryGreen.copy(0.3f))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("APPOINTMENT SUMMARY", fontWeight = FontWeight.Black, fontSize = 10.sp, color = PrimaryGreen)
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text("📅 Date: $formattedDateStr", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextDark)
+                        Text("⏰ Time: $slotLabel", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = PrimaryBlue)
+                        if (issueNote.isNotBlank()) {
+                            Text("🛠️ Issue: $issueNote", fontSize = 11.sp, color = Color.DarkGray)
                         }
                     }
                 }
@@ -1742,59 +2636,77 @@ fun AppointmentSchedulerDialog(
         },
         confirmButton = {
             Button(
-                enabled = !isBooking,
+                enabled = !isBooking && (selectedSlotObj?.isAvailable == true),
                 onClick = {
+                    val targetSlot = selectedSlotObj ?: return@Button
                     val uid = auth.currentUser?.uid ?: return@Button
                     isBooking = true
 
-                    // SLA Logic: Direct use of Calendar object - Create a clone to avoid modifying the UI state
-                    val cal = (selectedDateOption.calendar.clone() as Calendar)
-                    
-                    val hour = when(selectedSlot.take(2)) {
-                        "08" -> 8; "10" -> 10; "01" -> 13; "03" -> 15; else -> 8
-                    }
-                    cal.set(Calendar.HOUR_OF_DAY, hour)
-                    cal.set(Calendar.MINUTE, 0)
-                    cal.set(Calendar.SECOND, 0)
-
-                    val scheduledTimestamp = com.google.firebase.Timestamp(cal.time)
-
-                    val serviceRequest = mapOf(
-                        "technician" to techName,
-                        "status" to "pending",
-                        "scheduledDate" to selectedDateOption.label,
-                        "scheduledTime" to selectedSlot,
-                        "scheduledTimestamp" to scheduledTimestamp,
-                        "timestamp" to com.google.firebase.Timestamp.now(),
-                        "issue" to "Appointment: ${selectedDateOption.label} ($selectedSlot)",
-                        "aiDiagnostic" to aiDiagnosticResult
+                    // SERVER-SIDE ATOMIC CONFLICT VERIFICATION BEFORE COMMIT
+                    val conflict = ScheduleManager.hasConflict(
+                        technicianName = techName,
+                        startTimeMillis = targetSlot.startTimeMillis,
+                        endTimeMillis = targetSlot.endTimeMillis,
+                        bookings = bookingsState,
+                        timeOffBlocks = timeOffState
                     )
 
-                    val chatUpdate = mapOf(
+                    if (conflict) {
+                        Toast.makeText(context, "This time was just booked, please choose another slot.", Toast.LENGTH_LONG).show()
+                        isBooking = false
+                        return@Button
+                    }
+
+                    val dateLabel = fullDateFormatter.format(java.util.Date(targetSlot.startTimeMillis))
+                    val finalIssue = issueNote.ifBlank { "Scheduled Service Appointment" }
+
+                    val reqId = db.collection("service_requests").document().id
+                    val nowTimestamp = com.google.firebase.Timestamp.now()
+                    val serviceRequest = mapOf(
+                        "requestId" to reqId,
+                        "type" to "service",
+                        "customerUid" to uid,
                         "customerName" to customerName,
-                        "customerEmail" to (auth.currentUser?.email ?: ""),
                         "customerPhone" to customerPhone,
                         "customerAddress" to customerAddress,
-                        "status" to "Accepted (Direct Booking)",
-                        "assignedTechnician" to techName, // DIRECT ASSIGNMENT to make it "work" immediately
-                        "lastRequest" to "$techName • ${selectedDateOption.label} ($selectedSlot)",
-                        "scheduledTimestamp" to scheduledTimestamp,
-                        "timestamp" to com.google.firebase.Timestamp.now(),
-                        "aiDiagnostic" to aiDiagnosticResult
+                        "technicianName" to techName,
+                        "technician" to techName,
+                        "assignedTechnician" to techName,
+                        "status" to "Pending",
+                        "scheduledDate" to dateLabel,
+                        "scheduledTime" to targetSlot.formattedTimeRange,
+                        "scheduledStart" to com.google.firebase.Timestamp(java.util.Date(targetSlot.startTimeMillis)),
+                        "scheduledEnd" to com.google.firebase.Timestamp(java.util.Date(targetSlot.endTimeMillis)),
+                        "startTimeMillis" to targetSlot.startTimeMillis,
+                        "endTimeMillis" to targetSlot.endTimeMillis,
+                        "durationMinutes" to ScheduleManager.DEFAULT_SERVICE_DURATION_MINUTES,
+                        "bufferMinutes" to ScheduleManager.DEFAULT_BUFFER_MINUTES,
+                        "createdAt" to nowTimestamp,
+                        "updatedAt" to nowTimestamp,
+                        "createdAtMillis" to System.currentTimeMillis(),
+                        "issue" to "$finalIssue ($dateLabel - ${targetSlot.formattedTimeRange})",
+                        "statusHistory" to listOf(
+                            mapOf(
+                                "status" to "Pending",
+                                "updatedBy" to customerName,
+                                "timestampMillis" to System.currentTimeMillis(),
+                                "fromStatus" to "None"
+                            )
+                        )
                     )
 
-                    db.collection("chats_v2").document("admin_$uid").set(chatUpdate, com.google.firebase.firestore.SetOptions.merge())
-                    db.collection("chats_v2").document("admin_$uid").collection("services").add(serviceRequest)
+                    db.collection("service_requests").document(reqId).set(serviceRequest)
+                    db.collection("service_history").document(reqId).set(serviceRequest, com.google.firebase.firestore.SetOptions.merge())
 
                     val autoMsg = hashMapOf(
                         "senderId" to uid,
                         "senderName" to customerName,
-                        "text" to "Hello! I am scheduling a service appointment with $techName for ${selectedDateOption.label} during $selectedSlot.${if (aiDiagnosticResult != null) " AI Diagnostic: $aiDiagnosticResult" else ""}",
-                        "timestamp" to com.google.firebase.Timestamp.now()
+                        "text" to "Hello! I am scheduling a service appointment with $techName for $dateLabel during ${targetSlot.formattedTimeRange}. Service detail: $finalIssue.",
+                        "timestamp" to nowTimestamp
                     )
                     db.collection("chats_v2").document("admin_$uid").collection("messages").add(autoMsg)
 
-                    Toast.makeText(context, "Appointment scheduled for ${selectedDateOption.label} ($selectedSlot)!", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "Appointment requested for $dateLabel (${targetSlot.formattedTimeRange})!", Toast.LENGTH_LONG).show()
                     isBooking = false
                     onDismiss()
                 },
@@ -1802,12 +2714,18 @@ fun AppointmentSchedulerDialog(
                 shape = RoundedCornerShape(12.dp)
             ) {
                 if (isBooking) CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White)
-                else Text("Confirm Booking", fontWeight = FontWeight.Bold)
+                else {
+                    Icon(Icons.Default.CheckCircle, null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Confirm Appointment", fontWeight = FontWeight.Bold)
+                }
             }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
-        }
+        },
+        shape = RoundedCornerShape(24.dp),
+        containerColor = Color.White
     )
 }
 
@@ -1817,11 +2735,58 @@ fun CustomerChatHubView(onChatSelected: (String, String) -> Unit) {
     val db = remember { FirebaseFirestore.getInstance() }
     val auth = remember { FirebaseAuth.getInstance() }
     val uid = auth.currentUser?.uid ?: return
+
+    var adminLastMsg by remember { mutableStateOf("") }
+    var adminLastTs by remember { mutableStateOf<com.google.firebase.Timestamp?>(null) }
+    var adminStatus by remember { mutableStateOf<String?>(null) }
     var assignedTech by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) {
+    var techLastMsg by remember { mutableStateOf("") }
+    var techLastTs by remember { mutableStateOf<com.google.firebase.Timestamp?>(null) }
+    var techStatus by remember { mutableStateOf<String?>(null) }
+
+    val userProfilePics = remember { mutableStateMapOf<String, String?>() }
+    val userOnlineStatus = remember { mutableStateMapOf<String, Boolean>() }
+
+    LaunchedEffect(uid) {
+        db.collection("users").addSnapshotListener { uSnap, _ ->
+            uSnap?.documents?.forEach { uDoc ->
+                val name = uDoc.getString("name") ?: ""
+                val role = uDoc.getString("role") ?: ""
+                val pic = uDoc.getString("profilePicUrl")
+                val online = uDoc.getBoolean("isOnline") ?: false
+
+                if (name.isNotBlank()) {
+                    userProfilePics[name.lowercase(Locale.getDefault())] = pic
+                    userOnlineStatus[name.lowercase(Locale.getDefault())] = online
+                }
+                if (role.lowercase(Locale.getDefault()) == "admin") {
+                    userProfilePics["admin"] = pic
+                    userOnlineStatus["admin"] = online
+                }
+            }
+        }
+
         db.collection("chats_v2").document("admin_$uid").addSnapshotListener { doc, _ ->
-            assignedTech = doc?.getString("assignedTechnician")
+            if (doc != null && doc.exists()) {
+                assignedTech = doc.getString("assignedTechnician")
+                adminLastMsg = doc.getString("lastMessage") ?: "Customer Service Channel"
+                adminLastTs = doc.getTimestamp("timestamp")
+                adminStatus = doc.getString("status")
+            }
+        }
+    }
+
+    LaunchedEffect(assignedTech) {
+        if (!assignedTech.isNullOrBlank()) {
+            val techChatId = "tech_${assignedTech}_$uid"
+            db.collection("chats_v2").document(techChatId).addSnapshotListener { tDoc, _ ->
+                if (tDoc != null && tDoc.exists()) {
+                    techLastMsg = tDoc.getString("lastMessage") ?: "Direct Field Service Line"
+                    techLastTs = tDoc.getTimestamp("timestamp")
+                    techStatus = tDoc.getString("status")
+                }
+            }
         }
     }
 
@@ -1833,21 +2798,96 @@ fun CustomerChatHubView(onChatSelected: (String, String) -> Unit) {
         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             // Admin Channel
             item {
+                val adminPic = userProfilePics["admin"]
+                val isAdminOnline = userOnlineStatus["admin"] ?: false
+                val adminTimeStr = remember(adminLastTs) {
+                    if (adminLastTs == null) "" else {
+                        val date = adminLastTs!!.toDate()
+                        val now = Calendar.getInstance()
+                        val cal = Calendar.getInstance().apply { time = date }
+                        if (now.get(Calendar.YEAR) == cal.get(Calendar.YEAR) && now.get(Calendar.DAY_OF_YEAR) == cal.get(Calendar.DAY_OF_YEAR))
+                            SimpleDateFormat("h:mm a", Locale.getDefault()).format(date)
+                        else SimpleDateFormat("MMM d", Locale.getDefault()).format(date)
+                    }
+                }
+
                 Card(
-                    modifier = Modifier.fillMaxWidth().clickable { onChatSelected("admin_$uid", "Admin Support") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onChatSelected("admin_$uid", "Admin Support") },
                     colors = CardDefaults.cardColors(containerColor = Color.White),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                    elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                    shape = RoundedCornerShape(16.dp)
                 ) {
-                    Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Box(modifier = Modifier.size(50.dp).background(PrimaryBlue.copy(0.1f), CircleShape), contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.SupportAgent, null, tint = PrimaryBlue)
+                    Row(
+                        modifier = Modifier.padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(modifier = Modifier.size(48.dp)) {
+                            if (!adminPic.isNullOrBlank()) {
+                                AsyncImage(
+                                    model = adminPic,
+                                    contentDescription = "Admin Support",
+                                    modifier = Modifier.fillMaxSize().clip(CircleShape),
+                                    contentScale = ContentScale.Crop
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier.fillMaxSize().background(PrimaryBlue.copy(0.12f), CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "A",
+                                        fontWeight = FontWeight.Bold,
+                                        color = PrimaryBlue,
+                                        fontSize = 18.sp
+                                    )
+                                }
+                            }
+                            if (isAdminOnline) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(12.dp)
+                                        .align(Alignment.BottomEnd)
+                                        .background(PrimaryGreen, CircleShape)
+                                        .border(1.5.dp, Color.White, CircleShape)
+                                )
+                            }
                         }
+
                         Spacer(modifier = Modifier.width(14.dp))
+
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Admin Support", fontWeight = FontWeight.Bold, color = TextDark)
-                            Text("Customer Service Channel", fontSize = 12.sp, color = Color.Gray)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("Admin Support", fontWeight = FontWeight.Bold, color = TextDark, fontSize = 15.sp)
+                                if (adminTimeStr.isNotBlank()) {
+                                    Text(adminTimeStr, fontSize = 11.sp, color = Color.Gray)
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(3.dp))
+                            Text(
+                                text = adminLastMsg.ifBlank { "Customer Service Channel" },
+                                fontSize = 12.sp,
+                                color = Color.Gray,
+                                maxLines = 1
+                            )
+                            if (!adminStatus.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "Status: $adminStatus",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = if (adminStatus.equals("Completed", ignoreCase = true)) PrimaryGreen else PrimaryBlue
+                                )
+                            }
                         }
-                        Icon(Icons.AutoMirrored.Filled.Chat, null, tint = Color.LightGray)
+
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Icon(Icons.AutoMirrored.Filled.Chat, null, tint = Color.LightGray, modifier = Modifier.size(20.dp))
                     }
                 }
             }
@@ -1855,21 +2895,97 @@ fun CustomerChatHubView(onChatSelected: (String, String) -> Unit) {
             // Assigned Tech Channel
             if (assignedTech != null) {
                 item {
+                    val techName = assignedTech!!
+                    val techPic = userProfilePics[techName.lowercase(Locale.getDefault())]
+                    val isTechOnline = userOnlineStatus[techName.lowercase(Locale.getDefault())] ?: false
+                    val techTimeStr = remember(techLastTs) {
+                        if (techLastTs == null) "" else {
+                            val date = techLastTs!!.toDate()
+                            val now = Calendar.getInstance()
+                            val cal = Calendar.getInstance().apply { time = date }
+                            if (now.get(Calendar.YEAR) == cal.get(Calendar.YEAR) && now.get(Calendar.DAY_OF_YEAR) == cal.get(Calendar.DAY_OF_YEAR))
+                                SimpleDateFormat("h:mm a", Locale.getDefault()).format(date)
+                            else SimpleDateFormat("MMM d", Locale.getDefault()).format(date)
+                        }
+                    }
+
                     Card(
-                        modifier = Modifier.fillMaxWidth().clickable { onChatSelected("tech_${assignedTech}_$uid", assignedTech!!) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onChatSelected("tech_${techName}_$uid", techName) },
                         colors = CardDefaults.cardColors(containerColor = Color.White),
-                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+                        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+                        shape = RoundedCornerShape(16.dp)
                     ) {
-                        Row(modifier = Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(modifier = Modifier.size(50.dp).background(PrimaryGreen.copy(0.1f), CircleShape), contentAlignment = Alignment.Center) {
-                                Icon(Icons.Default.Build, null, tint = PrimaryGreen)
+                        Row(
+                            modifier = Modifier.padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(modifier = Modifier.size(48.dp)) {
+                                if (!techPic.isNullOrBlank()) {
+                                    AsyncImage(
+                                        model = techPic,
+                                        contentDescription = techName,
+                                        modifier = Modifier.fillMaxSize().clip(CircleShape),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                } else {
+                                    Box(
+                                        modifier = Modifier.fillMaxSize().background(PrimaryGreen.copy(0.12f), CircleShape),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = techName.take(1).uppercase(Locale.getDefault()),
+                                            fontWeight = FontWeight.Bold,
+                                            color = PrimaryGreen,
+                                            fontSize = 18.sp
+                                        )
+                                    }
+                                }
+                                if (isTechOnline) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(12.dp)
+                                            .align(Alignment.BottomEnd)
+                                            .background(PrimaryGreen, CircleShape)
+                                            .border(1.5.dp, Color.White, CircleShape)
+                                    )
+                                }
                             }
+
                             Spacer(modifier = Modifier.width(14.dp))
+
                             Column(modifier = Modifier.weight(1f)) {
-                                Text(assignedTech!!, fontWeight = FontWeight.Bold, color = TextDark)
-                                Text("Assigned Field Specialist", fontSize = 12.sp, color = PrimaryGreen, fontWeight = FontWeight.SemiBold)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(techName, fontWeight = FontWeight.Bold, color = TextDark, fontSize = 15.sp)
+                                    if (techTimeStr.isNotBlank()) {
+                                        Text(techTimeStr, fontSize = 11.sp, color = Color.Gray)
+                                    }
+                                }
+                                Spacer(modifier = Modifier.height(3.dp))
+                                Text(
+                                    text = techLastMsg.ifBlank { "Assigned Field Specialist" },
+                                    fontSize = 12.sp,
+                                    color = Color.Gray,
+                                    maxLines = 1
+                                )
+                                if (!techStatus.isNullOrBlank()) {
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = "Status: $techStatus",
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (techStatus.equals("Completed", ignoreCase = true)) PrimaryGreen else PrimaryBlue
+                                    )
+                                }
                             }
-                            Icon(Icons.AutoMirrored.Filled.Chat, null, tint = Color.LightGray)
+
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Icon(Icons.AutoMirrored.Filled.Chat, null, tint = Color.LightGray, modifier = Modifier.size(20.dp))
                         }
                     }
                 }
@@ -1881,11 +2997,13 @@ fun CustomerChatHubView(onChatSelected: (String, String) -> Unit) {
 // 📊 6. ORDER TRACKING & SERVICE HISTORY VIEW
 @Composable
 fun OrderTrackingView() {
+    val context = LocalContext.current
     val db = remember { FirebaseFirestore.getInstance() }
     val auth = remember { FirebaseAuth.getInstance() }
     val uid = auth.currentUser?.uid ?: ""
     val services = remember { mutableStateListOf<Map<String, Any>>() }
     var customerName by remember { mutableStateOf("") }
+    var parentAssignedTech by remember { mutableStateOf("") }
     var isLoadingServices by remember { mutableStateOf(true) }
 
     var selectedFilter by remember { mutableStateOf("All") }
@@ -1895,17 +3013,32 @@ fun OrderTrackingView() {
     LaunchedEffect(Unit) {
         db.collection("users").document(uid).get().addOnSuccessListener { customerName = it.getString("name") ?: "Customer" }
 
-        db.collection("chats_v2").document("admin_$uid").collection("services")
-            .orderBy("timestamp", Query.Direction.DESCENDING)
+        db.collection("service_requests")
+            .whereEqualTo("customerUid", uid)
             .addSnapshotListener { snapshot, _ ->
                 services.clear()
                 snapshot?.documents?.forEach { doc ->
                     val data = doc.data?.toMutableMap() ?: mutableMapOf()
                     data["docId"] = doc.id
+                    data["requestId"] = doc.id
                     services.add(data)
                 }
                 isLoadingServices = false
             }
+    }
+
+    val activeCount = services.count { svc ->
+        val st = svc["status"]?.toString()?.lowercase() ?: ""
+        st != "completed" && st != "cancelled" && st != "denied"
+    }
+
+    val completedCount = services.count { svc ->
+        svc["status"]?.toString()?.lowercase() == "completed"
+    }
+
+    val cancelledCount = services.count { svc ->
+        val st = svc["status"]?.toString()?.lowercase() ?: ""
+        st == "cancelled" || st == "denied"
     }
 
     val filteredServices = services.filter { svc ->
@@ -1936,39 +3069,134 @@ fun OrderTrackingView() {
         )
     }
 
-    Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("Service History & Receipts", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold, color = TextDark)
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Status Filter Chips
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(18.dp)
+    ) {
+        // Header
         Row(
-            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            listOf("All", "Active", "Completed", "Cancelled").forEach { flt ->
-                val isSel = selectedFilter == flt
-                Surface(
-                    modifier = Modifier.clickable { selectedFilter = flt }.height(32.dp),
-                    shape = RoundedCornerShape(16.dp),
-                    color = if (isSel) PrimaryBlue else Color.White,
-                    border = BorderStroke(1.dp, if (isSel) PrimaryBlue else Color(0xFFD0D0D0))
-                ) {
-                    Box(modifier = Modifier.padding(horizontal = 12.dp), contentAlignment = Alignment.Center) {
-                        Text(flt, fontSize = 11.sp, fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium, color = if (isSel) Color.White else TextDark)
+            Column {
+                Text("Order & Service Tracking", style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Black, fontSize = 20.sp, color = TextDark))
+                Text("Live Dispatch Timeline & Digital Receipts", fontSize = 12.sp, color = Color.Gray)
+            }
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // 📊 HIGH-DENSITY DASHBOARD METRICS
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            elevation = CardDefaults.cardElevation(2.dp),
+            border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("PLATFORM STATUS", fontSize = 10.sp, fontWeight = FontWeight.Black, color = Color.Gray)
+                    Text(if (activeCount > 0) "$activeCount Active Dispatch" else "All Services Clear", fontSize = 15.sp, fontWeight = FontWeight.Black, color = if (activeCount > 0) PrimaryBlue else PrimaryGreen)
+                }
+
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Surface(shape = RoundedCornerShape(10.dp), color = PrimaryBlue.copy(0.08f)) {
+                        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("$activeCount", fontWeight = FontWeight.Black, fontSize = 14.sp, color = PrimaryBlue)
+                            Text("Active", fontSize = 9.sp, color = PrimaryBlue, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Surface(shape = RoundedCornerShape(10.dp), color = PrimaryGreen.copy(0.08f)) {
+                        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text("$completedCount", fontWeight = FontWeight.Black, fontSize = 14.sp, color = PrimaryGreen)
+                            Text("Completed", fontSize = 9.sp, color = PrimaryGreen, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             }
         }
 
+        Spacer(modifier = Modifier.height(16.dp))
+
+        // 🏷️ STATUS FILTER CHIPS WITH COUNTERS
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            listOf(
+                "All" to services.size,
+                "Active" to activeCount,
+                "Completed" to completedCount,
+                "Cancelled" to cancelledCount
+            ).forEach { (flt, count) ->
+                val isSel = selectedFilter == flt
+                Surface(
+                    modifier = Modifier.clickable { selectedFilter = flt }.height(34.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (isSel) PrimaryBlue else Color.White,
+                    border = BorderStroke(1.dp, if (isSel) PrimaryBlue else Color(0xFFE2E8F0))
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            flt,
+                            fontSize = 12.sp,
+                            fontWeight = if (isSel) FontWeight.Bold else FontWeight.Medium,
+                            color = if (isSel) Color.White else TextDark
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Surface(
+                            shape = CircleShape,
+                            color = if (isSel) Color.White.copy(0.25f) else AppLightBg
+                        ) {
+                            Text(
+                                text = "$count",
+                                color = if (isSel) Color.White else Color.Gray,
+                                fontSize = 9.sp,
+                                fontWeight = FontWeight.Bold,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(4.dp))
+
         if (isLoadingServices) {
             ShimmerCardList(count = 3)
         } else if (filteredServices.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No service records found.", color = Color.Gray)
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White),
+                border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+            ) {
+                Column(
+                    modifier = Modifier.padding(32.dp).fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(Icons.AutoMirrored.Filled.Assignment, null, tint = Color.LightGray, modifier = Modifier.size(54.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("No Orders or Services Found", fontWeight = FontWeight.Black, color = TextDark, fontSize = 16.sp)
+                    Text("You have no service records matching the '$selectedFilter' filter.", fontSize = 12.sp, color = Color.Gray, textAlign = TextAlign.Center)
+                }
             }
         } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                items(filteredServices) { svc ->
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                filteredServices.forEach { svc ->
                     val status = svc["status"]?.toString() ?: ""
                     val isCompleted = status.equals("Completed", ignoreCase = true)
                     val rating = svc["rating"]?.toString()
@@ -1986,16 +3214,78 @@ fun OrderTrackingView() {
                         }
                     }
 
-                    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(16.dp), colors = CardDefaults.cardColors(containerColor = Color.White), elevation = CardDefaults.cardElevation(2.dp)) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(svc["technician"].toString(), fontWeight = FontWeight.Bold, color = PrimaryBlue)
-                                Spacer(modifier = Modifier.weight(1f))
-                                Text(status.uppercase(), color = if (isCompleted) PrimaryGreen else PrimaryBlue, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                    val rawTech = svc["technician"]?.toString() ?: ""
+                    val techDisplay = if (rawTech.contains("Hardware Team", true) || rawTech.isBlank()) {
+                        if (parentAssignedTech.isNotBlank()) "Expert: $parentAssignedTech (Installation)" else "Technician: Awaiting Admin Dispatch"
+                    } else {
+                        "Expert: $rawTech"
+                    }
+
+                    val issueText = svc["issue"]?.toString() ?: "HVAC Service & Repair"
+                    val techNotes = (svc["completionNotes"] ?: svc["notes"] ?: svc["workNotes"])?.toString()
+                    val partsUsed = (svc["partsUsed"] ?: svc["partsDetails"])?.toString()
+                    val partsFeeVal = (svc["partsFee"] as? Number)?.toDouble() ?: 0.0
+                    val laborFeeVal = (svc["laborFee"] as? Number)?.toDouble() ?: 0.0
+                    val totalFeeVal = (svc["totalAmount"] as? Number)?.toDouble() ?: (laborFeeVal + partsFeeVal)
+                    val aiDiag = svc["aiDiagnostic"]?.toString()
+
+                    Card(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color.White),
+                        elevation = CardDefaults.cardElevation(1.dp),
+                        border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                    ) {
+                        Column(modifier = Modifier.padding(14.dp)) {
+                            // Header Row: Tech Info + Status Badge
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(32.dp)
+                                            .background(PrimaryBlue.copy(0.1f), CircleShape),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = if (issueText.contains("Hardware", true)) Icons.Default.ShoppingCart else Icons.Default.Build,
+                                            contentDescription = null,
+                                            tint = PrimaryBlue,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(10.dp))
+                                    Text(
+                                        text = techDisplay,
+                                        fontWeight = FontWeight.Bold,
+                                        color = PrimaryBlue,
+                                        fontSize = 13.sp,
+                                        maxLines = 1
+                                    )
+                                }
+
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (isCompleted) PrimaryGreen.copy(0.12f) else PrimaryBlue.copy(0.12f)
+                                ) {
+                                    Text(
+                                        text = status.uppercase(),
+                                        color = if (isCompleted) PrimaryGreen else PrimaryBlue,
+                                        fontWeight = FontWeight.Black,
+                                        fontSize = 9.sp,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                    )
+                                }
                             }
 
                             if (isLate) {
-                                Spacer(modifier = Modifier.height(8.dp))
+                                Spacer(modifier = Modifier.height(6.dp))
                                 Surface(
                                     color = Color(0xFFFFEBEE),
                                     shape = RoundedCornerShape(8.dp),
@@ -2009,37 +3299,122 @@ fun OrderTrackingView() {
                                 }
                             }
 
-                            Text(svc["issue"].toString(), color = Color.Gray, fontSize = 13.sp, modifier = Modifier.padding(top = 4.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Text(issueText, fontWeight = FontWeight.Bold, color = TextDark, fontSize = 14.sp)
 
                             if (!schedDate.isNullOrBlank() && !schedTime.isNullOrBlank()) {
-                                Spacer(modifier = Modifier.height(6.dp))
+                                Spacer(modifier = Modifier.height(4.dp))
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.CalendarToday, null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
+                                    Icon(Icons.Default.CalendarToday, null, tint = PrimaryBlue, modifier = Modifier.size(13.dp))
                                     Spacer(modifier = Modifier.width(6.dp))
                                     Text("$schedDate • $schedTime", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = PrimaryBlue)
                                 }
                             }
 
-                            if (svc["notes"] != null) {
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text("Notes: ${svc["notes"]}", fontSize = 11.sp, color = TextDark)
+                            // 📝 TECHNICIAN NOTES & SUMMARY
+                            if (!techNotes.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Surface(
+                                    color = Color(0xFFF8FAFC),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, Color(0xFFE2E8F0)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(Icons.Default.Notes, null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Technician Notes:", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = PrimaryBlue)
+                                        }
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        Text(techNotes, fontSize = 11.sp, color = TextDark, lineHeight = 15.sp)
+                                    }
+                                }
                             }
 
-                            // Interactive Progress Timeline
+                            // 🔧 PARTS USED & REPLACEMENT MATERIALS
+                            if (!partsUsed.isNullOrBlank() || partsFeeVal > 0) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Surface(
+                                    color = Color(0xFFF0FDF4),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, Color(0xFFDCFCE7)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Icon(Icons.Default.Memory, null, tint = PrimaryGreen, modifier = Modifier.size(14.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text("Parts Used:", fontWeight = FontWeight.Bold, fontSize = 11.sp, color = PrimaryGreen)
+                                        }
+                                        Spacer(modifier = Modifier.height(2.dp))
+                                        val partsText = if (!partsUsed.isNullOrBlank()) {
+                                            "$partsUsed" + if (partsFeeVal > 0) " (₱${String.format(Locale.getDefault(), "%,.2f", partsFeeVal)})" else ""
+                                        } else {
+                                            "Parts Fee: ₱${String.format(Locale.getDefault(), "%,.2f", partsFeeVal)}"
+                                        }
+                                        Text(partsText, fontSize = 11.sp, color = TextDark, fontWeight = FontWeight.Medium)
+                                    }
+                                }
+                            }
+
+                            // 💰 FINANCIAL SUMMARY
+                            if (totalFeeVal > 0) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "Labor: ₱${String.format(Locale.getDefault(), "%,.0f", laborFeeVal)} | Parts: ₱${String.format(Locale.getDefault(), "%,.0f", partsFeeVal)}",
+                                        fontSize = 10.sp,
+                                        color = Color.Gray
+                                    )
+                                    Text(
+                                        text = "Total: ₱${String.format(Locale.getDefault(), "%,.2f", totalFeeVal)}",
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Black,
+                                        color = PrimaryBlue
+                                    )
+                                }
+                            }
+
+                            // 🤖 AI DIAGNOSTIC INSIGHT
+                            if (!aiDiag.isNullOrBlank()) {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Surface(
+                                    color = Color(0xFFEFF6FF),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, Color(0xFFBFDBFE)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(modifier = Modifier.padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                        Icon(Icons.Default.AutoAwesome, null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(aiDiag, fontSize = 10.sp, color = PrimaryBlue, lineHeight = 14.sp)
+                                    }
+                                }
+                            }
+
+                            // Compact Line & Step Timeline
                             Spacer(modifier = Modifier.height(10.dp))
-                            ServiceStepTimeline(status = status)
+                            HorizontalDivider(color = Color(0xFFF1F5F9))
                             Spacer(modifier = Modifier.height(10.dp))
 
+                            ServiceStepTimeline(status = status)
+
                             if (isCompleted) {
+                                Spacer(modifier = Modifier.height(10.dp))
                                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Button(
                                         onClick = { selectedServiceForReceipt = svc },
-                                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                                        modifier = Modifier.fillMaxWidth().height(38.dp),
                                         colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                                        shape = RoundedCornerShape(10.dp)
+                                        shape = RoundedCornerShape(8.dp)
                                     ) {
-                                        Icon(Icons.AutoMirrored.Filled.ReceiptLong, null, modifier = Modifier.size(18.dp), tint = Color.White)
-                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Icon(Icons.AutoMirrored.Filled.ReceiptLong, null, modifier = Modifier.size(16.dp), tint = Color.White)
+                                        Spacer(modifier = Modifier.width(6.dp))
                                         Text("View Digital E-Receipt", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                     }
 
@@ -2063,12 +3438,12 @@ fun OrderTrackingView() {
                                     } else {
                                         Button(
                                             onClick = { selectedServiceForRating = svc },
-                                            modifier = Modifier.fillMaxWidth().height(42.dp),
+                                            modifier = Modifier.fillMaxWidth().height(40.dp),
                                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFFB300)),
                                             shape = RoundedCornerShape(10.dp)
                                         ) {
                                             Icon(Icons.Default.Star, null, modifier = Modifier.size(16.dp), tint = Color.White)
-                                            Spacer(modifier = Modifier.width(8.dp))
+                                            Spacer(modifier = Modifier.width(6.dp))
                                             Text("Rate & Review Technician", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                         }
                                     }
@@ -2085,12 +3460,13 @@ fun OrderTrackingView() {
 @Composable
 fun ServiceStepTimeline(status: String) {
     val steps = listOf("Requested", "Accepted", "In Progress", "Completed")
-    val currentStep = when (status.lowercase()) {
-        "pending" -> 0
-        "accepted" -> 1
-        "in progress" -> 2
-        "completed" -> 3
-        else -> 0
+    val stLower = status.lowercase()
+    val currentStep = when {
+        stLower.contains("completed") -> 3
+        stLower.contains("progress") -> 2
+        stLower.contains("accepted") -> 1
+        stLower.contains("pending") || stLower.contains("requested") || stLower.contains("order") -> 0
+        else -> 1
     }
 
     Row(
@@ -2148,6 +3524,7 @@ fun DigitalReceiptDialog(
     val payMethod = service["paymentMethod"]?.toString() ?: "Cash"
     val labor = (service["laborFee"] as? Number)?.toDouble() ?: 500.0
     val parts = (service["partsFee"] as? Number)?.toDouble() ?: 0.0
+    val partsUsed = (service["partsUsed"] ?: service["partsDetails"])?.toString()
     val vat = (service["vatAmount"] as? Number)?.toDouble() ?: ((labor + parts) * 0.12)
     val total = (service["totalAmount"] as? Number)?.toDouble() ?: (labor + parts + vat)
 
@@ -2193,8 +3570,9 @@ fun DigitalReceiptDialog(
                 Spacer(modifier = Modifier.height(6.dp))
 
                 ReceiptFeeRow("Base Labor & Service Fee", "₱${String.format(Locale.getDefault(), "%.2f", labor)}")
-                if (parts > 0) {
-                    ReceiptFeeRow("Hardware & Parts Fee", "₱${String.format(Locale.getDefault(), "%.2f", parts)}")
+                if (parts > 0 || !partsUsed.isNullOrBlank()) {
+                    val labelStr = if (!partsUsed.isNullOrBlank()) "Parts ($partsUsed)" else "Hardware & Parts Fee"
+                    ReceiptFeeRow(labelStr, "₱${String.format(Locale.getDefault(), "%.2f", parts)}")
                 }
                 ReceiptFeeRow("VAT (12%)", "₱${String.format(Locale.getDefault(), "%.2f", vat)}")
 
@@ -2214,7 +3592,7 @@ fun DigitalReceiptDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    Toast.makeText(context, "E-Receipt saved to device Downloads!", Toast.LENGTH_LONG).show()
+                    ReportExporter.exportSingleReceiptToFile(context, customerName, service)
                     onDismiss()
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
@@ -2222,7 +3600,7 @@ fun DigitalReceiptDialog(
             ) {
                 Icon(Icons.Default.Download, null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Download Receipt (PDF)", fontWeight = FontWeight.Bold)
+                Text("Download E-Receipt File", fontWeight = FontWeight.Bold)
             }
         },
         dismissButton = {
@@ -2314,8 +3692,7 @@ fun RatingReviewDialog(
                         "ratedAt" to com.google.firebase.Timestamp.now()
                     )
 
-                    db.collection("chats_v2").document("admin_$customerUid")
-                        .collection("services").document(serviceDocId)
+                    db.collection("service_requests").document(serviceDocId)
                         .update(reviewData).addOnSuccessListener {
                             val publicReview = mapOf(
                                 "techName" to techName,
@@ -2422,6 +3799,38 @@ fun CustomerProfileView(onLogout: () -> Unit, viewModel: CustomerViewModel = hil
     var enableBiometrics by remember { mutableStateOf(true) }
     var showAddressDialog by remember { mutableStateOf(false) }
     var showManualPrivacy by remember { mutableStateOf(false) }
+    var showLogoutDialog by remember { mutableStateOf(false) }
+
+    var showChangePasswordDialog by remember { mutableStateOf(false) }
+    var showChangePinDialog by remember { mutableStateOf(false) }
+    var showNotificationPrefsDialog by remember { mutableStateOf(false) }
+    var showHelpSupportDialog by remember { mutableStateOf(false) }
+
+    if (showChangePasswordDialog) {
+        CustomerChangePasswordDialog(email = email, onDismiss = { showChangePasswordDialog = false })
+    }
+
+    if (showChangePinDialog) {
+        CustomerChangePinDialog(onDismiss = { showChangePinDialog = false })
+    }
+
+    if (showNotificationPrefsDialog) {
+        CustomerNotificationPrefsDialog(onDismiss = { showNotificationPrefsDialog = false })
+    }
+
+    if (showHelpSupportDialog) {
+        CustomerHelpSupportDialog(onDismiss = { showHelpSupportDialog = false })
+    }
+
+    if (showLogoutDialog) {
+        LogoutConfirmationDialog(
+            onConfirm = {
+                showLogoutDialog = false
+                onLogout()
+            },
+            onDismiss = { showLogoutDialog = false }
+        )
+    }
 
     LaunchedEffect(Unit) {
         val uid = auth.currentUser?.uid
@@ -2548,9 +3957,6 @@ fun CustomerProfileView(onLogout: () -> Unit, viewModel: CustomerViewModel = hil
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text("My Profile", fontSize = 24.sp, fontWeight = FontWeight.Bold, color = TextDark)
-            IconButton(onClick = onLogout) {
-                Icon(Icons.AutoMirrored.Filled.ExitToApp, "Logout", tint = Color(0xFFD32F2F), modifier = Modifier.size(24.dp))
-            }
         }
 
         Spacer(modifier = Modifier.height(20.dp))
@@ -2675,13 +4081,13 @@ fun CustomerProfileView(onLogout: () -> Unit, viewModel: CustomerViewModel = hil
                 ProfileOptionRow(
                     icon = Icons.Default.Lock,
                     title = "Change Password",
-                    onClick = { Toast.makeText(context, "Password reset email sent to $email", Toast.LENGTH_LONG).show() }
+                    onClick = { showChangePasswordDialog = true }
                 )
                 HorizontalDivider(color = Color(0xFFF0F0F0))
                 ProfileOptionRow(
                     icon = Icons.Default.Pin,
                     title = "Change Pin",
-                    onClick = { Toast.makeText(context, "Security PIN updated!", Toast.LENGTH_SHORT).show() }
+                    onClick = { showChangePinDialog = true }
                 )
                 HorizontalDivider(color = Color(0xFFF0F0F0))
 
@@ -2697,7 +4103,10 @@ fun CustomerProfileView(onLogout: () -> Unit, viewModel: CustomerViewModel = hil
                     }
                     Switch(
                         checked = enableBiometrics,
-                        onCheckedChange = { enableBiometrics = it },
+                        onCheckedChange = {
+                            enableBiometrics = it
+                            Toast.makeText(context, if (it) "Biometrics authentication enabled!" else "Biometrics disabled", Toast.LENGTH_SHORT).show()
+                        },
                         colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = PrimaryBlue)
                     )
                 }
@@ -2718,7 +4127,7 @@ fun CustomerProfileView(onLogout: () -> Unit, viewModel: CustomerViewModel = hil
                 ProfileOptionRow(
                     icon = Icons.Default.Notifications,
                     title = "Notification Preferences",
-                    onClick = { Toast.makeText(context, "Push notifications enabled", Toast.LENGTH_SHORT).show() }
+                    onClick = { showNotificationPrefsDialog = true }
                 )
                 HorizontalDivider(color = Color(0xFFF0F0F0))
                 ProfileOptionRow(
@@ -2730,7 +4139,14 @@ fun CustomerProfileView(onLogout: () -> Unit, viewModel: CustomerViewModel = hil
                 ProfileOptionRow(
                     icon = Icons.Default.SupportAgent,
                     title = "Help and Support",
-                    onClick = { Toast.makeText(context, "Connecting to Support Agent...", Toast.LENGTH_SHORT).show() }
+                    onClick = { showHelpSupportDialog = true }
+                )
+                HorizontalDivider(color = Color(0xFFF0F0F0))
+                ProfileOptionRow(
+                    icon = Icons.AutoMirrored.Filled.ExitToApp,
+                    title = "Log Out",
+                    subtitle = "Sign out of your CoolConnect account",
+                    onClick = { showLogoutDialog = true }
                 )
             }
         }
@@ -2839,14 +4255,14 @@ fun OrderSummaryCard(order: ShopOrder) {
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(order.orderId, fontWeight = FontWeight.Bold, color = PrimaryBlue, fontSize = 12.sp)
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text(order.orderId, fontWeight = FontWeight.Black, color = PrimaryBlue, fontSize = 13.sp)
                 Surface(
                     shape = RoundedCornerShape(8.dp),
                     color = when(order.status) {
-                        "Processing" -> Color(0xFFFF9800).copy(0.1f)
-                        "Delivered" -> PrimaryGreen.copy(0.1f)
-                        else -> Color.Gray.copy(0.1f)
+                        "Processing" -> Color(0xFFFF9800).copy(0.12f)
+                        "Delivered", "Completed" -> PrimaryGreen.copy(0.12f)
+                        else -> Color.Gray.copy(0.12f)
                     }
                 ) {
                     Text(
@@ -2856,7 +4272,7 @@ fun OrderSummaryCard(order: ShopOrder) {
                         fontWeight = FontWeight.Bold,
                         color = when(order.status) {
                             "Processing" -> Color(0xFFFF9800)
-                            "Delivered" -> PrimaryGreen
+                            "Delivered", "Completed" -> PrimaryGreen
                             else -> Color.Gray
                         }
                     )
@@ -2866,7 +4282,10 @@ fun OrderSummaryCard(order: ShopOrder) {
             Spacer(modifier = Modifier.height(8.dp))
             
             order.items.forEach { item ->
-                Text("• ${item["quantity"]}x ${item["name"]}", fontSize = 13.sp, color = TextDark)
+                val name = item["name"]?.toString() ?: "Hardware Item"
+                val qty = (item["quantity"] as? Number)?.toInt() ?: 1
+                val price = item["price"]?.toString() ?: ""
+                Text("• ${qty}x $name ($price)", fontSize = 12.sp, color = TextDark, fontWeight = FontWeight.Medium)
             }
             
             Spacer(modifier = Modifier.height(10.dp))
@@ -2875,10 +4294,271 @@ fun OrderSummaryCard(order: ShopOrder) {
             
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(sdf.format(order.timestamp.toDate()), fontSize = 11.sp, color = Color.Gray)
-                Text("Total: ₱${String.format(Locale.getDefault(), "%,.2f", order.total)}", fontWeight = FontWeight.Black, color = TextDark)
+                Text("Total Paid: ₱${String.format(Locale.getDefault(), "%,.2f", order.total)}", fontWeight = FontWeight.Black, color = PrimaryBlue, fontSize = 13.sp)
+            }
+            if (order.shippingAddress.isNotBlank()) {
+                Text("Address: ${order.shippingAddress}", fontSize = 10.sp, color = Color.Gray, maxLines = 1, modifier = Modifier.padding(top = 2.dp))
             }
         }
     }
+}
+
+@Composable
+fun CustomerChangePasswordDialog(email: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val auth = remember { FirebaseAuth.getInstance() }
+    var isSending by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Lock, null, tint = PrimaryBlue, modifier = Modifier.size(22.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Change Password", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = TextDark)
+            }
+        },
+        text = {
+            Column {
+                Text(
+                    "To secure your account, we will send a official password reset link to your registered email address:",
+                    fontSize = 13.sp,
+                    color = Color.Gray
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = AppLightBg,
+                    border = BorderStroke(1.dp, Color(0xFFE2E8F0)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(email, modifier = Modifier.padding(12.dp), fontWeight = FontWeight.Bold, color = TextDark, fontSize = 14.sp)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    isSending = true
+                    auth.sendPasswordResetEmail(email).addOnSuccessListener {
+                        Toast.makeText(context, "Password reset email sent to $email!", Toast.LENGTH_LONG).show()
+                        isSending = false
+                        onDismiss()
+                    }.addOnFailureListener { e ->
+                        Toast.makeText(context, "Error: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                        isSending = false
+                    }
+                },
+                enabled = !isSending,
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                if (isSending) CircularProgressIndicator(modifier = Modifier.size(16.dp), color = Color.White)
+                else Text("Send Password Reset Email", fontWeight = FontWeight.Bold)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
+        },
+        shape = RoundedCornerShape(20.dp),
+        containerColor = Color.White
+    )
+}
+
+@Composable
+fun CustomerChangePinDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val auth = remember { FirebaseAuth.getInstance() }
+    val db = remember { FirebaseFirestore.getInstance() }
+
+    var pinInput by remember { mutableStateOf("") }
+    var confirmPinInput by remember { mutableStateOf("") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Pin, null, tint = PrimaryBlue, modifier = Modifier.size(22.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Security PIN", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = TextDark)
+            }
+        },
+        text = {
+            Column {
+                Text("Set a 4-digit Security PIN for quick checkout & authentication:", fontSize = 12.sp, color = Color.Gray)
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedTextField(
+                    value = pinInput,
+                    onValueChange = { if (it.length <= 4 && it.all { c -> c.isDigit() }) pinInput = it },
+                    label = { Text("Enter 4-Digit PIN") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword)
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = confirmPinInput,
+                    onValueChange = { if (it.length <= 4 && it.all { c -> c.isDigit() }) confirmPinInput = it },
+                    label = { Text("Confirm 4-Digit PIN") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword)
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (pinInput.length != 4) {
+                        Toast.makeText(context, "PIN must be exactly 4 digits", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+                    if (pinInput != confirmPinInput) {
+                        Toast.makeText(context, "PINs do not match", Toast.LENGTH_SHORT).show()
+                        return@Button
+                    }
+                    val uid = auth.currentUser?.uid ?: return@Button
+                    db.collection("users").document(uid).update("pin", pinInput)
+                    Toast.makeText(context, "Security PIN updated successfully!", Toast.LENGTH_SHORT).show()
+                    onDismiss()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                shape = RoundedCornerShape(10.dp)
+            ) { Text("Save Security PIN", fontWeight = FontWeight.Bold) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
+        },
+        shape = RoundedCornerShape(20.dp),
+        containerColor = Color.White
+    )
+}
+
+@Composable
+fun CustomerNotificationPrefsDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var dispatchAlerts by remember { mutableStateOf(true) }
+    var orderUpdates by remember { mutableStateOf(true) }
+    var promoReminders by remember { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.Notifications, null, tint = PrimaryBlue, modifier = Modifier.size(22.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Notification Preferences", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = TextDark)
+            }
+        },
+        text = {
+            Column {
+                Row(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Service Dispatch & Arrival Alerts", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                        Text("Loud audio alerts when technician is en-route", fontSize = 10.sp, color = Color.Gray)
+                    }
+                    Switch(checked = dispatchAlerts, onCheckedChange = { dispatchAlerts = it }, colors = SwitchDefaults.colors(checkedTrackColor = PrimaryBlue))
+                }
+                HorizontalDivider(color = Color(0xFFF0F0F0))
+                Row(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Hardware Delivery Tracking", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                        Text("Updates on purchased items & delivery", fontSize = 10.sp, color = Color.Gray)
+                    }
+                    Switch(checked = orderUpdates, onCheckedChange = { orderUpdates = it }, colors = SwitchDefaults.colors(checkedTrackColor = PrimaryBlue))
+                }
+                HorizontalDivider(color = Color(0xFFF0F0F0))
+                Row(modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Maintenance & Seasonal Promos", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                        Text("Quarterly cleaning reminders & discounts", fontSize = 10.sp, color = Color.Gray)
+                    }
+                    Switch(checked = promoReminders, onCheckedChange = { promoReminders = it }, colors = SwitchDefaults.colors(checkedTrackColor = PrimaryBlue))
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    Toast.makeText(context, "Notification preferences updated!", Toast.LENGTH_SHORT).show()
+                    onDismiss()
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                shape = RoundedCornerShape(10.dp)
+            ) { Text("Save Preferences", fontWeight = FontWeight.Bold) }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel", color = Color.Gray) }
+        },
+        shape = RoundedCornerShape(20.dp),
+        containerColor = Color.White
+    )
+}
+
+@Composable
+fun CustomerHelpSupportDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Default.SupportAgent, null, tint = PrimaryBlue, modifier = Modifier.size(24.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Help & Customer Support", fontWeight = FontWeight.Bold, fontSize = 18.sp, color = TextDark)
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text("Need assistance with your HVAC booking or hardware order?", fontSize = 12.sp, color = Color.Gray)
+
+                Surface(
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        val callIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:0288882665"))
+                        context.startActivity(callIntent)
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    color = AppLightBg,
+                    border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                ) {
+                    Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Phone, null, tint = PrimaryGreen, modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text("Call Hotline: (02) 8888-COOL", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                            Text("24/7 Operations Command Line", fontSize = 10.sp, color = Color.Gray)
+                        }
+                    }
+                }
+
+                Surface(
+                    modifier = Modifier.fillMaxWidth().clickable {
+                        val emailIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:support@coolconnect.com"))
+                        context.startActivity(emailIntent)
+                    },
+                    shape = RoundedCornerShape(12.dp),
+                    color = AppLightBg,
+                    border = BorderStroke(1.dp, Color(0xFFE2E8F0))
+                ) {
+                    Row(modifier = Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Email, null, tint = PrimaryBlue, modifier = Modifier.size(20.dp))
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text("Email Support", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                            Text("support@coolconnect.com", fontSize = 10.sp, color = Color.Gray)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onDismiss, colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue), shape = RoundedCornerShape(10.dp)) {
+                Text("Done", fontWeight = FontWeight.Bold)
+            }
+        },
+        shape = RoundedCornerShape(20.dp),
+        containerColor = Color.White
+    )
 }
 
 @Composable
@@ -3001,4 +4681,114 @@ fun ProfileOptionRow(
         }
         Icon(Icons.Default.ChevronRight, null, tint = Color.LightGray)
     }
+}
+
+// 📍 CUSTOMER LOCATION PERMISSION DIALOG
+@Composable
+fun CustomerLocationPermissionDialog(
+    onGrantPermission: () -> Unit,
+    onEnableGps: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = {
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .background(Color(0xFFFFF0F0), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LocationOff,
+                    contentDescription = "Location Off",
+                    tint = Color.Red,
+                    modifier = Modifier.size(28.dp)
+                )
+            }
+        },
+        title = {
+            Text(
+                text = "Location is Turned Off",
+                fontWeight = FontWeight.Black,
+                fontSize = 18.sp,
+                color = TextDark,
+                textAlign = TextAlign.Center
+            )
+        },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    text = "CoolConnect requires location access to match you with nearby technicians and broadcast live updates during service dispatches.",
+                    fontSize = 13.sp,
+                    color = Color.Gray,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 18.sp
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = PrimaryBlue.copy(alpha = 0.08f),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.GpsFixed,
+                            contentDescription = null,
+                            tint = PrimaryBlue,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "Turn on GPS and allow location permission so field technicians can navigate to your address.",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = PrimaryBlue,
+                            lineHeight = 15.sp
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onEnableGps()
+                    onGrantPermission()
+                },
+                modifier = Modifier.fillMaxWidth().height(44.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Icon(Icons.Default.MyLocation, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Turn On Location (GPS)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+        },
+        dismissButton = {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = onOpenSettings,
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0xFFCBD5E1))
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = null, tint = TextDark, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Open App Settings", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = TextDark)
+                }
+                Spacer(modifier = Modifier.height(4.dp))
+                TextButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Not Now", color = Color.Gray, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                }
+            }
+        }
+    )
 }

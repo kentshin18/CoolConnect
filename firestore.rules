@@ -1,0 +1,116 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        getUserData().role == 'admin' ||
+        request.auth.token.email == 'admin@coolconnect.com'
+      );
+    }
+
+    function isTechnician() {
+      return isSignedIn() && (
+        getUserData().role == 'technician' ||
+        resource.data.technicianUid == request.auth.uid
+      );
+    }
+
+    // Users Collection
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+    }
+
+    // Service Requests Collection
+    match /service_requests/{requestId} {
+      allow read: if isSignedIn() && (
+        isAdmin() ||
+        resource.data.customerUid == request.auth.uid ||
+        resource.data.technicianUid == request.auth.uid ||
+        resource.data.technicianUid == null
+      );
+
+      allow create: if isSignedIn() && (
+        isAdmin() ||
+        request.resource.data.customerUid == request.auth.uid
+      );
+
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (resource.data.technicianUid == request.auth.uid &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+           'status', 'notes', 'completionNotes', 'partsUsed', 'laborFee',
+           'partsFee', 'vatAmount', 'totalAmount', 'photoProofUrl',
+           'signatureUrl', 'completedAt', 'updatedAt', 'hasPhotoProof'
+         ])) ||
+        (resource.data.customerUid == request.auth.uid &&
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+           'status', 'updatedAt', 'rating', 'comment', 'feedback'
+         ]))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // Orders Collection
+    match /orders/{orderId} {
+      allow read: if isSignedIn() && (
+        isAdmin() ||
+        resource.data.customerUid == request.auth.uid ||
+        resource.data.assignedTechnician != null
+      );
+      allow create: if isSignedIn() && request.resource.data.customerUid == request.auth.uid;
+      allow update: if isSignedIn() && (isAdmin() || resource.data.customerUid == request.auth.uid);
+      allow delete: if isAdmin();
+    }
+
+    // Chats Collection
+    match /chats_v2/{chatId} {
+      allow read, write: if isSignedIn();
+      match /messages/{messageId} {
+        allow read, write: if isSignedIn();
+      }
+      match /services/{serviceId} {
+        allow read, write: if isSignedIn();
+      }
+    }
+
+    // Service History Collection (Audit Trail / Legacy Sync)
+    match /service_history/{historyId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+    }
+
+    // Products & Technicians
+    match /products/{productId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    match /technician_configs/{techId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+    }
+
+    match /time_off_blocks/{blockId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn();
+    }
+
+    match /reviews/{reviewId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if isAdmin();
+    }
+  }
+}

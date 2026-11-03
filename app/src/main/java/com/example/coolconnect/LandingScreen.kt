@@ -6,8 +6,8 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -20,14 +20,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -67,16 +66,16 @@ fun LandingScreen(onGetStarted: () -> Unit) {
         FuturisticBackground()
 
         // Layer 2: Main Responsive Content Layout
-        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-            val isSmallScreen = maxHeight < 650.dp
+        val configuration = LocalConfiguration.current
+        val isSmallScreen = configuration.screenHeightDp.dp < 650.dp
 
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 24.dp, vertical = 36.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.SpaceBetween
-            ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 24.dp, vertical = 36.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
                 Spacer(modifier = Modifier.height(if (isSmallScreen) 20.dp else 40.dp))
 
                 // Section 1: Multi-Layer Animated Logo
@@ -148,7 +147,6 @@ fun LandingScreen(onGetStarted: () -> Unit) {
                     }
                 }
             }
-        }
     }
 }
 
@@ -354,7 +352,8 @@ private fun TrustIndicator() {
 // 🚀 5. FUTURISTIC CTA GET STARTED BUTTON
 @Composable
 private fun FuturisticGetStartedButton(onGetStarted: () -> Unit) {
-    var isPressed by remember { mutableStateOf(false) }
+    val interactionSource = remember { MutableInteractionSource() }
+    val isPressed by interactionSource.collectIsPressedAsState()
 
     val scaleScale by animateFloatAsState(
         targetValue = if (isPressed) 0.95f else 1f,
@@ -364,19 +363,11 @@ private fun FuturisticGetStartedButton(onGetStarted: () -> Unit) {
 
     Surface(
         onClick = onGetStarted,
+        interactionSource = interactionSource,
         modifier = Modifier
             .fillMaxWidth(0.88f)
             .height(60.dp)
-            .scale(scaleScale)
-            .pointerInput(Unit) {
-                detectTapGestures(
-                    onPress = {
-                        isPressed = true
-                        tryAwaitRelease()
-                        isPressed = false
-                    }
-                )
-            },
+            .scale(scaleScale),
         shape = RoundedCornerShape(30.dp),
         color = Color.Transparent,
         shadowElevation = 6.dp

@@ -22,10 +22,10 @@ class CoolConnectMessagingService : FirebaseMessagingService() {
     override fun onMessageReceived(message: RemoteMessage) {
         super.onMessageReceived(message)
         
-        val title = message.notification?.title ?: message.data["title"] ?: "CoolConnect Alert"
-        val body = message.notification?.body ?: message.data["body"] ?: "You have a new update."
+        val title = message.notification?.title ?: message.data["title"] ?: "🛠️ CoolConnect Field Dispatch Alert"
+        val body = message.notification?.body ?: message.data["body"] ?: "You have a new pending service dispatch request."
         
-        showNotification(title, body)
+        NotificationHelper.sendDispatchAlert(this, title, body)
     }
 
     private fun updateTokenInFirestore(token: String) {
