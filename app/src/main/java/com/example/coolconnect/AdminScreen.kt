@@ -2598,7 +2598,7 @@ fun ServiceHistoryFullScreen(
 
     val reportTypes = listOf(
         "MASTER" to Pair("Executive Master Summary", "Consolidated audit of all services, hardware orders, and platform revenue."),
-        "FINANCIAL" to Pair("Sales, Revenue & Financial Accounting", "Itemized labor income, parts sales, 12% VAT, and payment methods."),
+        "FINANCIAL" to Pair("Sales, Revenue & Financial Accounting", "Itemized labor income, parts sales, and payment methods."),
         "OPERATIONS" to Pair("Technician Services & Dispatch Log", "Jobs by date, technician performance, parts used, and work notes."),
         "HARDWARE" to Pair("Customer Hardware Orders & Parts", "Hardware catalog purchases, delivery locations, and item quantities."),
         "CUSTOMERS" to Pair("Customer Directory & Lifetime Accounts", "Registered customers list, contact details, address, and plan tier."),

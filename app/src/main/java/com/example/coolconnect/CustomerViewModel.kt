@@ -402,7 +402,7 @@ class CustomerViewModel @Inject constructor(
 
                 // 2. Calculate totals and details
                 val subtotal = cartItems.sumOf { it.product.price.replace("₱", "").replace(",", "").toDouble() * it.quantity }
-                val vat = subtotal * 0.12
+                val vat = 0.0
                 val total = subtotal + vat
 
                 val orderId = "ORD-${System.currentTimeMillis()}"

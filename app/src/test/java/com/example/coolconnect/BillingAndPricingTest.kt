@@ -11,12 +11,12 @@ class BillingAndPricingTest {
         val partsFee = 500.0
         val subtotal = laborFee + partsFee
         
-        val vatAmount = subtotal * 0.12
+        val vatAmount = 0.0
         val totalAmount = subtotal + vatAmount
 
         assertEquals(1500.0, subtotal, 0.01)
-        assertEquals(180.0, vatAmount, 0.01)
-        assertEquals(1680.0, totalAmount, 0.01)
+        assertEquals(0.0, vatAmount, 0.01)
+        assertEquals(1500.0, totalAmount, 0.01)
     }
 
     @Test

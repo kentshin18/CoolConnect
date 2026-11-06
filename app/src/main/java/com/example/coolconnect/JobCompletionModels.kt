@@ -18,7 +18,7 @@ data class FeeBreakdown(
 
 fun calculateFees(laborFee: Double, partsFee: Double): FeeBreakdown {
     val subtotal = laborFee + partsFee
-    val vat = subtotal * 0.12
+    val vat = 0.0
     val total = subtotal + vat
     return FeeBreakdown(
         labor = laborFee,

@@ -2647,10 +2647,6 @@ fun ServiceHistoryDetailDialog(
                             Text("Parts Fee", fontSize = 12.sp, color = Color.Gray)
                             Text("₱${String.format(Locale.getDefault(), "%.2f", item.partsFee)}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                         }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("VAT (12%)", fontSize = 12.sp, color = Color.Gray)
-                            Text("₱${String.format(Locale.getDefault(), "%.2f", item.vatAmount)}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        }
                         HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = Color.LightGray)
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                             Text("Total Amount", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = TextDark)
@@ -2719,7 +2715,7 @@ fun JobCompletionDialog(
     val laborVal = laborFeeInput.toDoubleOrNull() ?: 0.0
     val partsVal = partsFeeInput.toDoubleOrNull() ?: 0.0
     val subtotal = laborVal + partsVal
-    val vatAmount = subtotal * 0.12
+    val vatAmount = 0.0
     val totalAmount = subtotal + vatAmount
 
     var capturedPhoto by remember { mutableStateOf<Bitmap?>(null) }
@@ -2857,7 +2853,7 @@ fun JobCompletionDialog(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Total (incl. 12% VAT):", fontSize = 12.sp, fontWeight = FontWeight.Medium)
+                        Text("Total Amount:", fontSize = 12.sp, fontWeight = FontWeight.Medium)
                         Text("₱${String.format(Locale.getDefault(), "%.2f", totalAmount)}", fontWeight = FontWeight.Black, color = PrimaryBlue, fontSize = 16.sp)
                     }
                 }

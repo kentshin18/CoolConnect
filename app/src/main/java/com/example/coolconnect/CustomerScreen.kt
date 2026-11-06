@@ -1750,7 +1750,7 @@ fun FullScreenCheckoutScreen(
     }
 
     val subtotal = cart.sumOf { parsePriceDouble(it.product.price) * it.quantity }
-    val vat = subtotal * 0.12
+    val vat = 0.0
     val total = subtotal + vat
     val totalItemCount = cart.sumOf { it.quantity }
 
@@ -2195,14 +2195,6 @@ fun FullScreenCheckoutScreen(
                     ) {
                         Text("Product subtotal", fontSize = 13.sp, color = Color.Gray)
                         Text("₱${String.format(Locale.getDefault(), "%,.2f", subtotal)}", fontSize = 13.sp, color = TextDark, fontWeight = FontWeight.Medium)
-                    }
-
-                    Row(
-                        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Text("VAT (12%)", fontSize = 13.sp, color = Color.Gray)
-                        Text("₱${String.format(Locale.getDefault(), "%,.2f", vat)}", fontSize = 13.sp, color = TextDark, fontWeight = FontWeight.Medium)
                     }
 
                     Row(
@@ -5226,7 +5218,7 @@ fun DigitalReceiptDialog(
     val labor = (service["laborFee"] as? Number)?.toDouble() ?: 500.0
     val parts = (service["partsFee"] as? Number)?.toDouble() ?: 0.0
     val partsUsed = (service["partsUsed"] ?: service["partsDetails"])?.toString()
-    val vat = (service["vatAmount"] as? Number)?.toDouble() ?: ((labor + parts) * 0.12)
+    val vat = (service["vatAmount"] as? Number)?.toDouble() ?: 0.0
     val total = (service["totalAmount"] as? Number)?.toDouble() ?: (labor + parts + vat)
 
     AlertDialog(
@@ -5275,7 +5267,6 @@ fun DigitalReceiptDialog(
                     val labelStr = if (!partsUsed.isNullOrBlank()) "Parts ($partsUsed)" else "Hardware & Parts Fee"
                     ReceiptFeeRow(labelStr, "₱${String.format(Locale.getDefault(), "%.2f", parts)}")
                 }
-                ReceiptFeeRow("VAT (12%)", "₱${String.format(Locale.getDefault(), "%.2f", vat)}")
 
                 Spacer(modifier = Modifier.height(8.dp))
                 HorizontalDivider(color = Color.LightGray.copy(0.3f))

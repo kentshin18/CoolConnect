@@ -43,6 +43,11 @@ class AiAssistantRepository @Inject constructor(
 
     var customApiKey: String = ""
 
+    // Directory in-memory cache (60 seconds TTL)
+    @Volatile private var cachedCustomerDirectory: String = ""
+    @Volatile private var customerDirectoryCacheTimestamp: Long = 0L
+    private val CACHE_TTL_MS = 60_000L
+
     private fun getEffectiveApiKey(): String {
         if (customApiKey.isNotBlank()) return customApiKey
         val resKey = context?.getString(R.string.ai_secret_key)
@@ -52,256 +57,300 @@ class AiAssistantRepository @Inject constructor(
         return ""
     }
 
-    private suspend fun fetchCustomerHistoryContext(customerId: String, customerName: String): String = withContext(Dispatchers.IO) {
-        if (customerId.isBlank() && customerName.isBlank()) return@withContext ""
+    private suspend fun fetchCustomerHistoryContext(
+        customerId: String,
+        customerName: String,
+        question: String = ""
+    ): String = withContext(Dispatchers.IO) {
+        var targetId = customerId
+        var targetName = customerName
 
-        val startTime = System.currentTimeMillis()
-        try {
-            val historyBuilder = StringBuilder()
-            val targetChatId = if (customerId.startsWith("admin_")) customerId else "admin_$customerId"
-            val rawId = customerId.replace("admin_", "").replace("tech_", "")
-
-            // 1. Fetch main chat document
-            val chatDocSnap = try {
-                db.collection("chats_v2").document(targetChatId).get().await()
-            } catch (_: Exception) {
-                null
-            }
-
-            val docCustomerName = chatDocSnap?.getString("customerName") ?: chatDocSnap?.getString("chatName") ?: customerName
-            val currentStatus = chatDocSnap?.getString("status") ?: "Active"
-            val lastRequest = chatDocSnap?.getString("lastRequest") ?: ""
-
-            if (docCustomerName.isNotBlank() || rawId.isNotBlank()) {
-                historyBuilder.append("Customer Name: ${docCustomerName.ifBlank { rawId }}\n")
-                historyBuilder.append("Current Booking Status: $currentStatus\n")
-                if (lastRequest.isNotBlank()) {
-                    historyBuilder.append("Current Request: $lastRequest\n")
-                }
-            }
-
-            // 2. Fetch from top-level 'service_history' collection (with limit)
-            val serviceDocs = mutableListOf<com.google.firebase.firestore.DocumentSnapshot>()
-
-            if (rawId.isNotBlank()) {
-                try {
-                    val shSnap = db.collection("service_history")
-                        .whereEqualTo("customerUid", rawId)
-                        .limit(20)
-                        .get()
-                        .await()
-                    serviceDocs.addAll(shSnap.documents)
-                } catch (_: Exception) {}
-            }
-
-            if (serviceDocs.isEmpty() && docCustomerName.isNotBlank()) {
-                try {
-                    val shSnapName = db.collection("service_history")
-                        .whereEqualTo("customerName", docCustomerName)
-                        .limit(20)
-                        .get()
-                        .await()
-                    serviceDocs.addAll(shSnapName.documents)
-                } catch (_: Exception) {}
-            }
-
-            // Fallback: Fetch services sub-collection under chats_v2/targetChatId/services
-            if (serviceDocs.isEmpty()) {
-                try {
-                    val servicesSnap = db.collection("chats_v2")
-                        .document(targetChatId)
-                        .collection("services")
-                        .limit(20)
-                        .get()
-                        .await()
-                    serviceDocs.addAll(servicesSnap.documents)
-                } catch (_: Exception) {}
-            }
-
-            // Also check rawId if targetChatId didn't return services
-            if (serviceDocs.isEmpty() && targetChatId != rawId && rawId.isNotBlank()) {
-                try {
-                    val rawServicesSnap = db.collection("chats_v2")
-                        .document(rawId)
-                        .collection("services")
-                        .limit(20)
-                        .get()
-                        .await()
-                    serviceDocs.addAll(rawServicesSnap.documents)
-                } catch (_: Exception) {}
-            }
-
-            // Fallback: Query collection group if still empty
-            if (serviceDocs.isEmpty() && rawId.isNotBlank()) {
-                try {
-                    val cgSnap = db.collectionGroup("services")
-                        .whereEqualTo("customerUid", rawId)
-                        .limit(20)
-                        .get()
-                        .await()
-                    serviceDocs.addAll(cgSnap.documents)
-                } catch (_: Exception) {}
-            }
-
-            if (serviceDocs.isNotEmpty()) {
-                historyBuilder.append("Past Service Entries (${serviceDocs.size} total):\n")
-
-                val sortedDocs = serviceDocs.sortedByDescending { doc ->
-                    doc.getTimestamp("completedAt")?.toDate()?.time
-                        ?: doc.getTimestamp("timestamp")?.toDate()?.time
-                        ?: doc.getTimestamp("scheduledTimestamp")?.toDate()?.time
-                        ?: 0L
-                }
-
-                for ((index, doc) in sortedDocs.withIndex()) {
-                    val status = doc.getString("status") ?: "Unknown"
-                    val issue = doc.getString("issue") ?: doc.getString("lastRequest") ?: doc.getString("notes") ?: "HVAC Service"
-                    val notes = doc.getString("completionNotes") ?: doc.getString("notes") ?: "N/A"
-                    val partsUsed = doc.getString("partsUsed") ?: "None"
-                    val totalAmount = (doc.get("totalAmount") as? Number)?.toDouble()
-                    val tech = doc.getString("lastTechnician") ?: doc.getString("technician") ?: doc.getString("assignedTechnician") ?: "N/A"
-                    val dateObj = doc.getTimestamp("completedAt")?.toDate()
-                        ?: doc.getTimestamp("timestamp")?.toDate()
-                        ?: doc.getTimestamp("scheduledTimestamp")?.toDate()
-                    val dateStr = if (dateObj != null) {
-                        java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault()).format(dateObj)
-                    } else "N/A"
-
-                    historyBuilder.append("  ${index + 1}. [$dateStr] Status: $status | Service: $issue | Work Done/Notes: $notes | Parts Used: $partsUsed | Tech: $tech")
-                    if (totalAmount != null && totalAmount > 0) {
-                        historyBuilder.append(" | Total: ₱${String.format(java.util.Locale.getDefault(), "%.2f", totalAmount)}")
+        // If no customer is explicitly assigned, check if the question mentions a registered customer
+        if (targetId.isBlank() && targetName.isBlank() && question.isNotBlank()) {
+            val directory = fetchAllCustomersDirectoryContext()
+            if (directory.isNotBlank()) {
+                val lines = directory.lines()
+                for (line in lines) {
+                    if (line.contains("Customer Name:")) {
+                        val namePart = line.substringAfter("Customer Name:").substringBefore("|").trim()
+                        val uidPart = line.substringAfter("Customer UID:").substringBefore("|").trim()
+                        if (namePart.isNotBlank() && question.contains(namePart, ignoreCase = true)) {
+                            targetName = namePart
+                            targetId = uidPart
+                            Log.d(TAG, "Auto-detected customer from question: name='$targetName', uid='$targetId'")
+                            break
+                        }
                     }
-                    historyBuilder.append("\n")
-                }
-            } else {
-                val mainNotes = chatDocSnap?.getString("completionNotes")
-                val mainParts = chatDocSnap?.getString("partsUsed")
-                val mainTech = chatDocSnap?.getString("lastTechnician")
-                val mainTotal = (chatDocSnap?.get("totalAmount") as? Number)?.toDouble()
-
-                if (!mainNotes.isNullOrBlank() || !mainParts.isNullOrBlank()) {
-                    historyBuilder.append("Last Completed Service:\n")
-                    if (!mainNotes.isNullOrBlank()) historyBuilder.append("  • Notes: $mainNotes\n")
-                    if (!mainParts.isNullOrBlank()) historyBuilder.append("  • Parts Used: $mainParts\n")
-                    if (!mainTech.isNullOrBlank()) historyBuilder.append("  • Technician: $mainTech\n")
-                    if (mainTotal != null && mainTotal > 0) historyBuilder.append("  • Amount: ₱${String.format(java.util.Locale.getDefault(), "%.2f", mainTotal)}\n")
-                } else {
-                    historyBuilder.append("No prior completed service history found in database for this customer.\n")
                 }
             }
-
-            // 3. Fetch orders / parts purchased by customer from top-level 'orders' collection (with limit)
-            val orderDocs = mutableListOf<com.google.firebase.firestore.DocumentSnapshot>()
-            if (rawId.isNotBlank()) {
-                try {
-                    val ordersSnap = db.collection("orders")
-                        .whereEqualTo("customerUid", rawId)
-                        .limit(20)
-                        .get()
-                        .await()
-                    orderDocs.addAll(ordersSnap.documents)
-                } catch (_: Exception) {}
-            }
-
-            if (orderDocs.isNotEmpty()) {
-                historyBuilder.append("\nParts & Products Purchased (${orderDocs.size} order(s)):\n")
-                val sortedOrders = orderDocs.sortedByDescending { it.getTimestamp("timestamp")?.toDate()?.time ?: 0L }
-                for ((index, orderDoc) in sortedOrders.withIndex()) {
-                    val orderId = orderDoc.getString("orderId") ?: orderDoc.id
-                    val status = orderDoc.getString("status") ?: "Completed"
-                    val itemsSummary = orderDoc.getString("itemsSummary") ?: "Hardware order"
-                    val total = (orderDoc.get("total") as? Number)?.toDouble() ?: 0.0
-                    val dateObj = orderDoc.getTimestamp("timestamp")?.toDate()
-                    val dateStr = if (dateObj != null) {
-                        java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault()).format(dateObj)
-                    } else "N/A"
-
-                    historyBuilder.append("  ${index + 1}. [$dateStr] Order ID: $orderId | Status: $status | Items: $itemsSummary | Total: ₱${String.format(java.util.Locale.getDefault(), "%.2f", total)}\n")
-                }
-            }
-
-            Log.d(TAG, "Customer history fetched in ${System.currentTimeMillis() - startTime} ms for customerId: '$customerId'")
-            historyBuilder.toString().trim()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error fetching customer history for AI: ${e.localizedMessage}")
-            ""
         }
+
+        if (targetId.isBlank() && targetName.isBlank()) return@withContext ""
+
+        withTimeoutOrNull(3000.milliseconds) {
+            val startTime = System.currentTimeMillis()
+            try {
+                val historyBuilder = StringBuilder()
+                val targetChatId = if (targetId.startsWith("admin_")) targetId else "admin_$targetId"
+                val rawId = targetId.replace("admin_", "").replace("tech_", "")
+
+                coroutineScope {
+                    val chatDocDeferred = async {
+                        try {
+                            if (targetChatId.isNotBlank()) db.collection("chats_v2").document(targetChatId).get().await() else null
+                        } catch (_: Exception) { null }
+                    }
+
+                    val serviceRequestsDeferred = async {
+                        val docs = mutableListOf<com.google.firebase.firestore.DocumentSnapshot>()
+                        if (rawId.isNotBlank()) {
+                            try {
+                                val srSnap = db.collection("service_requests")
+                                    .whereEqualTo("customerUid", rawId)
+                                    .limit(20)
+                                    .get()
+                                    .await()
+                                docs.addAll(srSnap.documents)
+                            } catch (_: Exception) {}
+                        }
+                        if (docs.isEmpty() && targetName.isNotBlank()) {
+                            try {
+                                val srSnapName = db.collection("service_requests")
+                                    .whereEqualTo("customerName", targetName)
+                                    .limit(20)
+                                    .get()
+                                    .await()
+                                docs.addAll(srSnapName.documents)
+                            } catch (_: Exception) {}
+                        }
+                        docs
+                    }
+
+                    val serviceHistoryDeferred = async {
+                        val docs = mutableListOf<com.google.firebase.firestore.DocumentSnapshot>()
+                        if (rawId.isNotBlank()) {
+                            try {
+                                val shSnap = db.collection("service_history")
+                                    .whereEqualTo("customerUid", rawId)
+                                    .limit(20)
+                                    .get()
+                                    .await()
+                                docs.addAll(shSnap.documents)
+                            } catch (_: Exception) {}
+                        }
+                        if (docs.isEmpty() && targetName.isNotBlank()) {
+                            try {
+                                val shSnapName = db.collection("service_history")
+                                    .whereEqualTo("customerName", targetName)
+                                    .limit(20)
+                                    .get()
+                                    .await()
+                                docs.addAll(shSnapName.documents)
+                            } catch (_: Exception) {}
+                        }
+                        docs
+                    }
+
+                    val ordersDeferred = async {
+                        val docs = mutableListOf<com.google.firebase.firestore.DocumentSnapshot>()
+                        if (rawId.isNotBlank()) {
+                            try {
+                                val ordersSnap = db.collection("orders")
+                                    .whereEqualTo("customerUid", rawId)
+                                    .limit(20)
+                                    .get()
+                                    .await()
+                                docs.addAll(ordersSnap.documents)
+                            } catch (_: Exception) {}
+                        }
+                        docs
+                    }
+
+                    val chatDocSnap = chatDocDeferred.await()
+                    val serviceReqDocs = serviceRequestsDeferred.await()
+                    val serviceHistDocs = serviceHistoryDeferred.await()
+                    val orderDocs = ordersDeferred.await()
+
+                    val docCustomerName = chatDocSnap?.getString("customerName") ?: chatDocSnap?.getString("chatName") ?: targetName
+                    val currentStatus = chatDocSnap?.getString("status") ?: "Active"
+                    val lastRequest = chatDocSnap?.getString("lastRequest") ?: ""
+
+                    if (docCustomerName.isNotBlank() || rawId.isNotBlank()) {
+                        historyBuilder.append("Customer Name: ${docCustomerName.ifBlank { rawId }}\n")
+                        historyBuilder.append("Current Booking Status: $currentStatus\n")
+                        if (lastRequest.isNotBlank()) {
+                            historyBuilder.append("Current Request: $lastRequest\n")
+                        }
+                    }
+
+                    val allServiceDocsMap = mutableMapOf<String, com.google.firebase.firestore.DocumentSnapshot>()
+                    serviceReqDocs.forEach { allServiceDocsMap[it.id] = it }
+                    serviceHistDocs.forEach { allServiceDocsMap[it.id] = it }
+
+                    val serviceDocs = allServiceDocsMap.values.toList()
+
+                    if (serviceDocs.isNotEmpty()) {
+                        historyBuilder.append("Past Service Entries (${serviceDocs.size} total):\n")
+
+                        val sortedDocs = serviceDocs.sortedByDescending { doc ->
+                            doc.getTimestamp("completedAt")?.toDate()?.time
+                                ?: doc.getTimestamp("timestamp")?.toDate()?.time
+                                ?: doc.getTimestamp("scheduledTimestamp")?.toDate()?.time
+                                ?: doc.getTimestamp("createdAt")?.toDate()?.time
+                                ?: 0L
+                        }
+
+                        for ((index, doc) in sortedDocs.withIndex()) {
+                            val status = doc.getString("status") ?: "Unknown"
+                            val issue = doc.getString("issue") ?: doc.getString("serviceType") ?: doc.getString("lastRequest") ?: doc.getString("notes") ?: "HVAC Service"
+                            val notes = doc.getString("completionNotes") ?: doc.getString("notes") ?: doc.getString("details") ?: "N/A"
+                            val partsUsed = doc.getString("partsUsed") ?: "None"
+                            val totalAmount = (doc.get("totalAmount") as? Number)?.toDouble() ?: (doc.get("price") as? Number)?.toDouble()
+                            val tech = doc.getString("lastTechnician") ?: doc.getString("technician") ?: doc.getString("assignedTechnician") ?: doc.getString("technicianName") ?: "N/A"
+                            val dateObj = doc.getTimestamp("completedAt")?.toDate()
+                                ?: doc.getTimestamp("timestamp")?.toDate()
+                                ?: doc.getTimestamp("scheduledTimestamp")?.toDate()
+                                ?: doc.getTimestamp("createdAt")?.toDate()
+                            val dateStr = if (dateObj != null) {
+                                java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault()).format(dateObj)
+                            } else "N/A"
+
+                            historyBuilder.append("  ${index + 1}. [$dateStr] Status: $status | Service: $issue | Work Done/Notes: $notes | Parts Used: $partsUsed | Tech: $tech")
+                            if (totalAmount != null && totalAmount > 0) {
+                                historyBuilder.append(" | Total: ₱${String.format(java.util.Locale.getDefault(), "%.2f", totalAmount)}")
+                            }
+                            historyBuilder.append("\n")
+                        }
+                    } else {
+                        val mainNotes = chatDocSnap?.getString("completionNotes")
+                        val mainParts = chatDocSnap?.getString("partsUsed")
+                        val mainTech = chatDocSnap?.getString("lastTechnician")
+                        val mainTotal = (chatDocSnap?.get("totalAmount") as? Number)?.toDouble()
+
+                        if (!mainNotes.isNullOrBlank() || !mainParts.isNullOrBlank()) {
+                            historyBuilder.append("Last Completed Service:\n")
+                            if (!mainNotes.isNullOrBlank()) historyBuilder.append("  • Notes: $mainNotes\n")
+                            if (!mainParts.isNullOrBlank()) historyBuilder.append("  • Parts Used: $mainParts\n")
+                            if (!mainTech.isNullOrBlank()) historyBuilder.append("  • Technician: $mainTech\n")
+                            if (mainTotal != null && mainTotal > 0) historyBuilder.append("  • Amount: ₱${String.format(java.util.Locale.getDefault(), "%.2f", mainTotal)}\n")
+                        } else {
+                            historyBuilder.append("No prior completed service history found in database for this customer.\n")
+                        }
+                    }
+
+                    if (orderDocs.isNotEmpty()) {
+                        historyBuilder.append("\nParts & Products Purchased (${orderDocs.size} order(s)):\n")
+                        val sortedOrders = orderDocs.sortedByDescending { it.getTimestamp("timestamp")?.toDate()?.time ?: 0L }
+                        for ((index, orderDoc) in sortedOrders.withIndex()) {
+                            val orderId = orderDoc.getString("orderId") ?: orderDoc.id
+                            val status = orderDoc.getString("status") ?: "Completed"
+                            val itemsSummary = orderDoc.getString("itemsSummary") ?: "Hardware order"
+                            val total = (orderDoc.get("total") as? Number)?.toDouble() ?: 0.0
+                            val dateObj = orderDoc.getTimestamp("timestamp")?.toDate()
+                            val dateStr = if (dateObj != null) {
+                                java.text.SimpleDateFormat("MMM dd, yyyy", java.util.Locale.getDefault()).format(dateObj)
+                            } else "N/A"
+
+                            historyBuilder.append("  ${index + 1}. [$dateStr] Order ID: $orderId | Status: $status | Items: $itemsSummary | Total: ₱${String.format(java.util.Locale.getDefault(), "%.2f", total)}\n")
+                        }
+                    }
+                }
+
+                Log.d(TAG, "Customer history fetched in ${System.currentTimeMillis() - startTime} ms for customerId: '$targetId'")
+                historyBuilder.toString().trim()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error fetching customer history for AI: ${e.localizedMessage}")
+                ""
+            }
+        } ?: ""
     }
 
     private suspend fun fetchAllCustomersDirectoryContext(): String = withContext(Dispatchers.IO) {
-        val startTime = System.currentTimeMillis()
-        try {
-            val directoryBuilder = StringBuilder()
-            val customerEntries = mutableListOf<String>()
-            val seenUids = mutableSetOf<String>()
-            val currentTechUid = auth.currentUser?.uid ?: ""
-
-            // 1. Fetch active/recent customer chats from 'chats_v2' (limited to 50 entries)
-            try {
-                val chatsSnap = db.collection("chats_v2").limit(50).get().await()
-                chatsSnap.documents.forEach { doc ->
-                    val cUid = doc.getString("customerUid")
-                        ?: doc.id.replace("admin_", "").replace("tech_", "")
-                    val cName = doc.getString("customerName") ?: doc.getString("chatName") ?: ""
-                    val status = doc.getString("status") ?: "Active"
-                    val issue = doc.getString("lastRequest") ?: doc.getString("issue") ?: ""
-                    val tech = doc.getString("assignedTechnician") ?: doc.getString("lastTechnician") ?: "Unassigned"
-
-                    if (cUid.isNotBlank() && cUid != currentTechUid && !seenUids.contains(cUid)) {
-                        seenUids.add(cUid)
-                        val nameStr = cName.ifBlank { "Customer" }
-                        // Compliant with Data Privacy Act: Omit phone numbers and exact residential addresses from prompt context
-                        val entry = StringBuilder("• Customer Name: $nameStr | Customer UID: $cUid | Booking Status: $status")
-                        if (issue.isNotBlank()) entry.append(" | Request: $issue")
-                        if (tech.isNotBlank()) entry.append(" | Tech: $tech")
-                        customerEntries.add(entry.toString())
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error fetching chats_v2 for directory: ${e.localizedMessage}")
-            }
-
-            // 2. Fetch registered customer users from 'users' collection (limited to 50 entries)
-            try {
-                val usersSnap = db.collection("users").limit(50).get().await()
-                usersSnap.documents.forEach { doc ->
-                    val role = doc.getString("role") ?: "customer"
-                    val uid = doc.getString("uid") ?: doc.id
-                    if (role != "admin" && role != "technician" && uid != currentTechUid && !seenUids.contains(uid)) {
-                        seenUids.add(uid)
-                        val name = doc.getString("name") ?: "Customer"
-                        // Compliant with Data Privacy Act: Omit phone numbers and exact residential addresses from prompt context
-                        customerEntries.add("• Customer Name: $name | Customer UID: $uid | Role: Customer")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Error fetching users for directory: ${e.localizedMessage}")
-            }
-
-            if (customerEntries.isNotEmpty()) {
-                directoryBuilder.append("ALL SYSTEM CUSTOMERS DIRECTORY (${customerEntries.size} Total Registered Customers):\n")
-                customerEntries.forEach { entry ->
-                    directoryBuilder.append(entry).append("\n")
-                }
-            } else {
-                directoryBuilder.append("No registered customers found in system directory.\n")
-            }
-
-            Log.d(TAG, "Customer directory fetched in ${System.currentTimeMillis() - startTime} ms (${customerEntries.size} entries)")
-            directoryBuilder.toString().trim()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error building customer directory: ${e.localizedMessage}")
-            ""
+        val now = System.currentTimeMillis()
+        if (cachedCustomerDirectory.isNotBlank() && (now - customerDirectoryCacheTimestamp) < CACHE_TTL_MS) {
+            Log.d(TAG, "Using cached customer directory (${cachedCustomerDirectory.length} chars)")
+            return@withContext cachedCustomerDirectory
         }
+
+        val result = withTimeoutOrNull(2000.milliseconds) {
+            val startTime = System.currentTimeMillis()
+            try {
+                val directoryBuilder = StringBuilder()
+                val customerEntries = mutableListOf<String>()
+                val seenUids = mutableSetOf<String>()
+                val currentTechUid = auth.currentUser?.uid ?: ""
+
+                // 1. Fetch active/recent customer chats from 'chats_v2' (limited to 50 entries)
+                try {
+                    val chatsSnap = db.collection("chats_v2").limit(50).get().await()
+                    chatsSnap.documents.forEach { doc ->
+                        val cUid = doc.getString("customerUid")
+                            ?: doc.id.replace("admin_", "").replace("tech_", "")
+                        val cName = doc.getString("customerName") ?: doc.getString("chatName") ?: ""
+                        val status = doc.getString("status") ?: "Active"
+                        val issue = doc.getString("lastRequest") ?: doc.getString("issue") ?: ""
+                        val tech = doc.getString("assignedTechnician") ?: doc.getString("lastTechnician") ?: "Unassigned"
+
+                        if (cUid.isNotBlank() && cUid != currentTechUid && !seenUids.contains(cUid)) {
+                            seenUids.add(cUid)
+                            val nameStr = cName.ifBlank { "Customer" }
+                            // Compliant with Data Privacy Act: Omit phone numbers and exact residential addresses from prompt context
+                            val entry = StringBuilder("• Customer Name: $nameStr | Customer UID: $cUid | Booking Status: $status")
+                            if (issue.isNotBlank()) entry.append(" | Request: $issue")
+                            if (tech.isNotBlank()) entry.append(" | Tech: $tech")
+                            customerEntries.add(entry.toString())
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error fetching chats_v2 for directory: ${e.localizedMessage}")
+                }
+
+                // 2. Fetch registered customer users from 'users' collection (limited to 50 entries)
+                try {
+                    val usersSnap = db.collection("users").limit(50).get().await()
+                    usersSnap.documents.forEach { doc ->
+                        val role = doc.getString("role") ?: "customer"
+                        val uid = doc.getString("uid") ?: doc.id
+                        if (role != "admin" && role != "technician" && uid != currentTechUid && !seenUids.contains(uid)) {
+                            seenUids.add(uid)
+                            val name = doc.getString("name") ?: "Customer"
+                            // Compliant with Data Privacy Act: Omit phone numbers and exact residential addresses from prompt context
+                            customerEntries.add("• Customer Name: $name | Customer UID: $uid | Role: Customer")
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error fetching users for directory: ${e.localizedMessage}")
+                }
+
+                if (customerEntries.isNotEmpty()) {
+                    directoryBuilder.append("ALL SYSTEM CUSTOMERS DIRECTORY (${customerEntries.size} Total Registered Customers):\n")
+                    customerEntries.forEach { entry ->
+                        directoryBuilder.append(entry).append("\n")
+                    }
+                } else {
+                    directoryBuilder.append("No registered customers found in system directory.\n")
+                }
+
+                Log.d(TAG, "Customer directory fetched in ${System.currentTimeMillis() - startTime} ms (${customerEntries.size} entries)")
+                directoryBuilder.toString().trim()
+            } catch (e: Exception) {
+                Log.w(TAG, "Error building customer directory: ${e.localizedMessage}")
+                ""
+            }
+        } ?: ""
+
+        if (result.isNotBlank()) {
+            cachedCustomerDirectory = result
+            customerDirectoryCacheTimestamp = now
+        }
+        result
     }
 
     suspend fun getCustomerRecommendation(customerId: String): Result<String> = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
         Log.d(TAG, "getCustomerRecommendation started for customerId: '$customerId'")
 
-        val history = withTimeoutOrNull(3000.milliseconds) {
-            fetchCustomerHistoryContext(customerId, "")
-        } ?: ""
+        val history = fetchCustomerHistoryContext(customerId, "")
         val promptQuestion = "Based on my HVAC service history and orders, give me a personalized 1-2 sentence health assessment of my AC unit and your top recommended service or replacement part (like Compressor, Filter, Freon, or Maintenance)."
 
         val workerStartTime = System.currentTimeMillis()
@@ -361,11 +410,7 @@ class AiAssistantRepository @Inject constructor(
                 }
             }
             val historyDeferred = async {
-                if (isSpecificCustomerSelected) {
-                    fetchCustomerHistoryContext(effectiveCustomerId, customerName)
-                } else {
-                    ""
-                }
+                fetchCustomerHistoryContext(effectiveCustomerId, customerName, question)
             }
             Pair(directoryDeferred.await(), historyDeferred.await())
         }
@@ -439,11 +484,7 @@ class AiAssistantRepository @Inject constructor(
                 }
             }
             val historyDeferred = async {
-                if (isSpecificCustomerSelected) {
-                    fetchCustomerHistoryContext(effectiveCustomerId, customerName)
-                } else {
-                    ""
-                }
+                fetchCustomerHistoryContext(effectiveCustomerId, customerName, question)
             }
             Pair(directoryDeferred.await(), historyDeferred.await())
         }
@@ -508,9 +549,9 @@ class AiAssistantRepository @Inject constructor(
         try {
             val apiKey = getEffectiveApiKey()
 
-            // Fetch Firebase token with strict 3-second timeout
+            // Fetch Firebase token with strict 1.5-second timeout
             val firebaseToken = try {
-                withTimeoutOrNull(3000.milliseconds) {
+                withTimeoutOrNull(1500.milliseconds) {
                     auth.currentUser?.getIdToken(false)?.await()?.token
                 }
             } catch (_: Exception) {
@@ -562,8 +603,8 @@ class AiAssistantRepository @Inject constructor(
                     Result.success(reply)
                 } else {
                     if (attempt == 1) {
-                        Log.d(TAG, "Worker reply invalid on attempt 1, retrying worker once after 500ms...")
-                        delay(500)
+                        Log.d(TAG, "Worker reply invalid on attempt 1, retrying worker once after 300ms...")
+                        delay(300)
                         callWorker(mode, customerId, customerName, question, customerHistory, allowFallback, attempt = 2)
                     } else if (allowFallback && !question.isNullOrBlank()) {
                         Log.d(TAG, "Worker reply invalid on attempt 2, triggering internal fallback...")
@@ -574,8 +615,8 @@ class AiAssistantRepository @Inject constructor(
                 }
             } else {
                 if (attempt == 1) {
-                    Log.d(TAG, "Worker HTTP ${response.code} on attempt 1, retrying worker once after 500ms...")
-                    delay(500)
+                    Log.d(TAG, "Worker HTTP ${response.code} on attempt 1, retrying worker once after 300ms...")
+                    delay(300)
                     callWorker(mode, customerId, customerName, question, customerHistory, allowFallback, attempt = 2)
                 } else if (allowFallback && !question.isNullOrBlank()) {
                     Log.d(TAG, "Worker response unsuccessful (code ${response.code}), triggering internal fallback...")
@@ -587,8 +628,8 @@ class AiAssistantRepository @Inject constructor(
         } catch (e: Exception) {
             Log.w(TAG, "Worker call threw exception on attempt $attempt in ${System.currentTimeMillis() - workerStartTime} ms: ${e.localizedMessage}")
             if (attempt == 1) {
-                Log.d(TAG, "Worker exception on attempt 1, retrying worker once after 500ms...")
-                delay(500)
+                Log.d(TAG, "Worker exception on attempt 1, retrying worker once after 300ms...")
+                delay(300)
                 callWorker(mode, customerId, customerName, question, customerHistory, allowFallback, attempt = 2)
             } else if (allowFallback && !question.isNullOrBlank()) {
                 Log.d(TAG, "Triggering internal fallback after attempt 2 exception...")
@@ -610,7 +651,7 @@ class AiAssistantRepository @Inject constructor(
         val apiKey = getEffectiveApiKey()
 
         val firebaseToken = try {
-            withTimeoutOrNull(3000.milliseconds) {
+            withTimeoutOrNull(1500.milliseconds) {
                 auth.currentUser?.getIdToken(false)?.await()?.token
             }
         } catch (_: Exception) {
@@ -828,6 +869,16 @@ class AiAssistantRepository @Inject constructor(
 
                 val content = json.optString("content", "")
                 if (content.isNotBlank()) return content
+
+                val candidates = json.optJSONArray("candidates")
+                if (candidates != null && candidates.length() > 0) {
+                    val contentObj = candidates.getJSONObject(0).optJSONObject("content")
+                    val parts = contentObj?.optJSONArray("parts")
+                    if (parts != null && parts.length() > 0) {
+                        val text = parts.getJSONObject(0).optString("text", "")
+                        if (text.isNotBlank()) return text
+                    }
+                }
 
                 val choices = json.optJSONArray("choices")
                 if (choices != null && choices.length() > 0) {

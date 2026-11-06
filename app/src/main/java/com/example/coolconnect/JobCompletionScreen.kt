@@ -611,13 +611,6 @@ fun JobCompletionScreen(
                                         Text("Parts Fee", fontSize = 13.sp, color = Color.Gray)
                                         Text("₱${String.format(Locale.getDefault(), "%.2f", fees.parts)}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
                                     }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween
-                                    ) {
-                                        Text("VAT (12%)", fontSize = 13.sp, color = Color.Gray)
-                                        Text("₱${String.format(Locale.getDefault(), "%.2f", fees.vat)}", fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                                    }
                                     HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp), color = FieldBorder)
                                     Row(
                                         modifier = Modifier.fillMaxWidth(),
@@ -898,10 +891,6 @@ fun JobCompletionScreen(
                                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                         Text("Parts Fee", fontSize = 12.sp, color = Color.Gray)
                                         Text("₱${String.format(Locale.getDefault(), "%.2f", fees.parts)}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                                    }
-                                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                        Text("VAT (12%)", fontSize = 12.sp, color = Color.Gray)
-                                        Text("₱${String.format(Locale.getDefault(), "%.2f", fees.vat)}", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                                     }
                                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                                         Text("Total Amount", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = TextDark)

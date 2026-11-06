@@ -61,7 +61,7 @@ object ReportExporter {
         sb.append("Report Date:,\"$exportDate\"\n")
         sb.append("Total Services:,\"${services.size}\",Total Orders:,\"${orders.size}\"\n\n")
 
-        sb.append("Activity ID,Date,Category,Customer Name,Item / Service Description,Assigned Technician,Parts Used,Labor Fee,Parts Fee,VAT (12%),Total Amount,Payment Method,Status\n")
+        sb.append("Activity ID,Date,Category,Customer Name,Item / Service Description,Assigned Technician,Parts Used,Labor Fee,Parts Fee,VAT,Total Amount,Payment Method,Status\n")
 
         var activityCounter = 10001
 
@@ -109,7 +109,7 @@ object ReportExporter {
         sb.append("COOLCONNECT FINANCIAL ACCOUNTING & REVENUE REPORT\n")
         sb.append("Report Date:,\"${DATE_FORMAT.format(Date())}\"\n\n")
 
-        sb.append("Activity ID,Date,Revenue Stream,Customer Name,Labor Revenue,Parts & Hardware Sales,VAT (12%),Gross Total,Payment Method,Payment Status\n")
+        sb.append("Activity ID,Date,Revenue Stream,Customer Name,Labor Revenue,Parts & Hardware Sales,VAT,Gross Total,Payment Method,Payment Status\n")
 
         var txCounter = 20001
 
@@ -275,7 +275,7 @@ object ReportExporter {
         val labor = (service["laborFee"] as? Number)?.toDouble() ?: 500.0
         val partsFee = (service["partsFee"] as? Number)?.toDouble() ?: 0.0
         val partsUsed = (service["partsUsed"] ?: service["partsDetails"])?.toString()
-        val vat = (service["vatAmount"] as? Number)?.toDouble() ?: ((labor + partsFee) * 0.12)
+        val vat = (service["vatAmount"] as? Number)?.toDouble() ?: 0.0
         val total = (service["totalAmount"] as? Number)?.toDouble() ?: (labor + partsFee + vat)
         val notes = (service["completionNotes"] ?: service["notes"])?.toString() ?: "None"
         val dateStr = formatDateOnly(service["completedAt"] ?: service["timestamp"])
@@ -304,7 +304,6 @@ object ReportExporter {
             ----------------------------------------------------
             Labor & Service Fee:  ₱${String.format(Locale.getDefault(), "%,.2f", labor)}
             Parts & Hardware Fee: ₱${String.format(Locale.getDefault(), "%,.2f", partsFee)}
-            VAT (12%):            ₱${String.format(Locale.getDefault(), "%,.2f", vat)}
             ----------------------------------------------------
             TOTAL AMOUNT PAID:    ₱${String.format(Locale.getDefault(), "%,.2f", total)}
             ====================================================
