@@ -33,7 +33,10 @@ class LoginViewModel @Inject constructor(
                                 val role = doc.getString("role") ?: "customer"
                                 onResult(Result.success(role))
                             }
-                            .addOnFailureListener { onResult(Result.failure(it)) }
+                            .addOnFailureListener {
+                                // Default fallback if fetching user document fails
+                                onResult(Result.success("customer"))
+                            }
                     } else {
                         onResult(Result.success("customer"))
                     }
@@ -127,10 +130,16 @@ class LoginViewModel @Inject constructor(
     }
 
     private fun saveFcmToken(uid: String) {
-        messaging.token.addOnCompleteListener { task ->
-            if (task.isSuccessful) {
-                db.collection("users").document(uid).update("fcmToken", task.result)
+        try {
+            messaging.token.addOnCompleteListener { task ->
+                if (task.isSuccessful) {
+                    val token = task.result
+                    if (!token.isNullOrBlank()) {
+                        db.collection("users").document(uid)
+                            .set(mapOf("fcmToken" to token), com.google.firebase.firestore.SetOptions.merge())
+                    }
+                }
             }
-        }
+        } catch (_: Exception) {}
     }
 }

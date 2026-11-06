@@ -1,19 +1,29 @@
 package com.example.coolconnect
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.net.Uri
 import android.util.Log
+import android.widget.Toast
+import androidx.compose.runtime.mutableStateListOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.android.gms.maps.model.LatLng
+import com.google.firebase.Timestamp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
-import com.google.firebase.firestore.QuerySnapshot
+import com.google.firebase.firestore.SetOptions
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
+import java.util.UUID
 import javax.inject.Inject
 
 @HiltViewModel
@@ -185,10 +195,6 @@ class TechnicianViewModel @Inject constructor(
                         if (isActiveStatus(status) && (isServiceJob || isApprovedPartsJob)) {
                             if (!seenIds.contains(docId)) {
                                 seenIds.add(docId)
-                                val startTime = (doc.get("startTimeMillis") as? Number)?.toLong()
-                                    ?: doc.getTimestamp("scheduledStart")?.toDate()?.time
-                                    ?: doc.getTimestamp("scheduledTimestamp")?.toDate()?.time
-                                    ?: 0L
 
                                 jobs.add(
                                     TechJobDetail(
@@ -210,7 +216,9 @@ class TechnicianViewModel @Inject constructor(
                 }
                 
                 _activeJobs.value = jobs
-                val firstActive = jobs.firstOrNull()
+                val firstActive = jobs.find { it.status.equals("In Progress", ignoreCase = true) }
+                    ?: jobs.find { it.status.equals("Accepted", ignoreCase = true) }
+                    ?: jobs.firstOrNull()
                 _primaryJob.value = firstActive
 
                 if (firstActive != null) {
@@ -290,7 +298,7 @@ class TechnicianViewModel @Inject constructor(
     }
 
     fun startJob(jobId: String) {
-        val timestamp = com.google.firebase.Timestamp.now()
+        val timestamp = Timestamp.now()
         val currentTech = techName.value
         val updates = mapOf(
             "status" to "In Progress",
@@ -318,7 +326,7 @@ class TechnicianViewModel @Inject constructor(
                     }
                 }
             }
-        db.collection("service_history").document(jobId).set(updates, com.google.firebase.firestore.SetOptions.merge())
+        db.collection("service_history").document(jobId).set(updates, SetOptions.merge())
     }
 
     // Atomic Job Completion using Firestore WriteBatch
@@ -346,7 +354,7 @@ class TechnicianViewModel @Inject constructor(
             val orderId = reqDoc.getString("orderId")
 
             val batch = db.batch()
-            val timestamp = com.google.firebase.Timestamp.now()
+            val timestamp = Timestamp.now()
             val hasProof = photoProofUrl.isNotBlank()
 
             val serviceUpdates = hashMapOf(
@@ -396,7 +404,7 @@ class TechnicianViewModel @Inject constructor(
                 "completedAt" to timestamp,
                 "timestamp" to timestamp
             )
-            batch.set(serviceHistoryRef, serviceHistoryDoc, com.google.firebase.firestore.SetOptions.merge())
+            batch.set(serviceHistoryRef, serviceHistoryDoc, SetOptions.merge())
 
             if (customerUid.isNotBlank()) {
                 val msgRef = db.collection("chats_v2").document("admin_$customerUid").collection("messages").document()
@@ -452,6 +460,24 @@ class TechnicianViewModel @Inject constructor(
         )
     }
 
+    fun queryAiAssistantStream(
+        question: String,
+        customerId: String? = null,
+        customerName: String? = null
+    ): Flow<String> {
+        val targetCustomerId = customerId?.ifBlank { null }
+            ?: _assignedCustomerId.value
+            ?: ""
+        val targetCustomerName = customerName?.ifBlank { null }
+            ?: _assignedCustomerName.value
+            ?: ""
+        return aiRepository.getTechnicianAssistantStream(
+            question = question,
+            customerId = targetCustomerId,
+            customerName = targetCustomerName
+        )
+    }
+
     fun fetchRoute(origin: LatLng, destination: LatLng, apiKey: String) {
         viewModelScope.launch {
             val routeResult = NavigationUtils.getRouteDetails(origin, destination, apiKey)
@@ -467,11 +493,11 @@ class TechnicianViewModel @Inject constructor(
         _routeDistance.value = null
     }
 
-    fun uploadKycDoc(uri: android.net.Uri, context: android.content.Context) {
+    fun uploadKycDoc(uri: Uri, context: Context) {
         viewModelScope.launch {
             when (val validation = ImageUtils.validateImageUri(context, uri)) {
                 is ImageUtils.ValidationResult.Error -> {
-                    android.widget.Toast.makeText(context, validation.message, android.widget.Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, validation.message, Toast.LENGTH_LONG).show()
                     return@launch
                 }
                 is ImageUtils.ValidationResult.Success -> { /* proceed */ }
@@ -479,20 +505,20 @@ class TechnicianViewModel @Inject constructor(
             _isKycUploading.value = true
             try {
                 repository.uploadKYCDocument(uri)
-                android.widget.Toast.makeText(context, "Verification document uploaded! Pending review.", android.widget.Toast.LENGTH_LONG).show()
+                Toast.makeText(context, "Verification document uploaded! Pending review.", Toast.LENGTH_LONG).show()
             } catch (e: Exception) {
-                android.widget.Toast.makeText(context, "Upload failed: ${e.localizedMessage}", android.widget.Toast.LENGTH_LONG).show()
+                Toast.makeText(context, "Upload failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
             } finally {
                 _isKycUploading.value = false
             }
         }
     }
 
-    fun uploadProfilePic(uri: android.net.Uri, context: android.content.Context) {
+    fun uploadProfilePic(uri: Uri, context: Context) {
         viewModelScope.launch {
             when (val validation = ImageUtils.validateImageUri(context, uri)) {
                 is ImageUtils.ValidationResult.Error -> {
-                    android.widget.Toast.makeText(context, validation.message, android.widget.Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, validation.message, Toast.LENGTH_LONG).show()
                     return@launch
                 }
                 is ImageUtils.ValidationResult.Success -> { /* proceed */ }
@@ -501,23 +527,23 @@ class TechnicianViewModel @Inject constructor(
             try {
                 val newUrl = repository.uploadProfilePicture(uri)
                 _profilePicUrl.value = newUrl
-                android.widget.Toast.makeText(context, "Profile picture updated!", android.widget.Toast.LENGTH_SHORT).show()
+                Toast.makeText(context, "Profile picture updated!", Toast.LENGTH_SHORT).show()
             } catch (e: Exception) {
-                android.util.Log.e("TechnicianViewModel", "Upload failed", e)
-                android.widget.Toast.makeText(context, "Upload failed: ${e.localizedMessage}", android.widget.Toast.LENGTH_LONG).show()
+                Log.e("TechnicianViewModel", "Upload failed", e)
+                Toast.makeText(context, "Upload failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
             } finally {
                 _isUploading.value = false
             }
         }
     }
 
-    fun uploadBitmapImage(bitmap: android.graphics.Bitmap, folder: String, onResult: (Result<String>) -> Unit) {
+    fun uploadBitmapImage(bitmap: Bitmap, folder: String, onResult: (Result<String>) -> Unit) {
         viewModelScope.launch {
             try {
                 val url = repository.uploadBitmapImage(bitmap, folder)
                 onResult(Result.success(url))
             } catch (e: Exception) {
-                android.util.Log.e("TechnicianViewModel", "Bitmap upload failed", e)
+                Log.e("TechnicianViewModel", "Bitmap upload failed", e)
                 onResult(Result.failure(e))
             }
         }
@@ -531,20 +557,20 @@ class TechnicianViewModel @Inject constructor(
     fun updateLocation(latitude: Double, longitude: Double) {
         val uid = auth.currentUser?.uid ?: return
         db.collection("users").document(uid).update(
-            mapOf("latitude" to latitude, "longitude" to longitude, "lastUpdated" to com.google.firebase.Timestamp.now())
+            mapOf("latitude" to latitude, "longitude" to longitude, "lastUpdated" to Timestamp.now())
         )
     }
 
-    val aiMessages = androidx.compose.runtime.mutableStateListOf<AiChatMessage>()
+    val aiMessages = mutableStateListOf<AiChatMessage>()
     private var isChatLoaded = false
 
-    fun loadAiChatHistory(context: android.content.Context) {
+    fun loadAiChatHistory(context: Context) {
         if (isChatLoaded) return
         isChatLoaded = true
         try {
-            val prefs = context.getSharedPreferences("coolconnect_ai_chat", android.content.Context.MODE_PRIVATE)
+            val prefs = context.getSharedPreferences("coolconnect_ai_chat", Context.MODE_PRIVATE)
             val jsonStr = prefs.getString("chat_history", null) ?: return
-            val jsonArray = org.json.JSONArray(jsonStr)
+            val jsonArray = JSONArray(jsonStr)
             val loadedList = mutableListOf<AiChatMessage>()
             for (i in 0 until jsonArray.length()) {
                 val obj = jsonArray.getJSONObject(i)
@@ -552,7 +578,7 @@ class TechnicianViewModel @Inject constructor(
                 val sender = if (senderStr == "AI") MessageSender.AI else MessageSender.USER
                 loadedList.add(
                     AiChatMessage(
-                        id = obj.optString("id", java.util.UUID.randomUUID().toString()),
+                        id = obj.optString("id", UUID.randomUUID().toString()),
                         sender = sender,
                         text = obj.optString("text", ""),
                         timestamp = obj.optLong("timestamp", System.currentTimeMillis()),
@@ -563,16 +589,16 @@ class TechnicianViewModel @Inject constructor(
             aiMessages.clear()
             aiMessages.addAll(loadedList)
         } catch (e: Exception) {
-            android.util.Log.e("TechnicianViewModel", "Error loading AI chat history", e)
+            Log.e("TechnicianViewModel", "Error loading AI chat history", e)
         }
     }
 
-    fun saveAiChatHistory(context: android.content.Context) {
+    fun saveAiChatHistory(context: Context) {
         try {
-            val jsonArray = org.json.JSONArray()
+            val jsonArray = JSONArray()
             for (msg in aiMessages) {
                 if (msg.isPending) continue
-                val obj = org.json.JSONObject().apply {
+                val obj = JSONObject().apply {
                     put("id", msg.id)
                     put("sender", msg.sender.name)
                     put("text", msg.text)
@@ -583,20 +609,20 @@ class TechnicianViewModel @Inject constructor(
                 }
                 jsonArray.put(obj)
             }
-            val prefs = context.getSharedPreferences("coolconnect_ai_chat", android.content.Context.MODE_PRIVATE)
+            val prefs = context.getSharedPreferences("coolconnect_ai_chat", Context.MODE_PRIVATE)
             prefs.edit().putString("chat_history", jsonArray.toString()).apply()
         } catch (e: Exception) {
-            android.util.Log.e("TechnicianViewModel", "Error saving AI chat history", e)
+            Log.e("TechnicianViewModel", "Error saving AI chat history", e)
         }
     }
 
-    fun clearAiChatHistory(context: android.content.Context) {
+    fun clearAiChatHistory(context: Context) {
         aiMessages.clear()
         try {
-            val prefs = context.getSharedPreferences("coolconnect_ai_chat", android.content.Context.MODE_PRIVATE)
+            val prefs = context.getSharedPreferences("coolconnect_ai_chat", Context.MODE_PRIVATE)
             prefs.edit().remove("chat_history").apply()
         } catch (e: Exception) {
-            android.util.Log.e("TechnicianViewModel", "Error clearing AI chat history", e)
+            Log.e("TechnicianViewModel", "Error clearing AI chat history", e)
         }
     }
 

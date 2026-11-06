@@ -504,6 +504,7 @@ fun FullChatScreen(
                 colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White)
             )
         },
+        contentWindowInsets = WindowInsets.statusBars,
         bottomBar = {
             ChatInputBar(
                 value = inputText,
@@ -876,8 +877,10 @@ fun ChatBubble(
                         AsyncImage(
                             model = msg.imageUrl,
                             contentDescription = "Photo Attachment",
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(4.dp),
+                            contentScale = ContentScale.Fit
                         )
                     }
                     Spacer(modifier = Modifier.height(4.dp))
@@ -1164,31 +1167,8 @@ fun ConversationListScreen(
 
                 when (userRole.lowercase(Locale.getDefault())) {
                     "customer" -> {
-                        // Include admin support channel for this customer
-                        if (chatId == "admin_$currentUserId" || (customerUid == currentUserId && chatId.startsWith("admin_"))) {
-                            val adminUser = userByName["admin support"] ?: userMap.values.firstOrNull { it["role"] == "admin" }
-                            val adminUid = adminUser?.get("uid")?.toString() ?: "admin"
-                            val adminPic = adminUser?.get("profilePicUrl")?.toString()
-                            val isOnline = adminUser?.get("isOnline") as? Boolean ?: false
-
-                            newItems.add(
-                                ConversationItem(
-                                    chatId = chatId,
-                                    recipientId = adminUid,
-                                    recipientName = "Admin Support",
-                                    recipientProfilePic = adminPic,
-                                    recipientRole = "admin",
-                                    isOnline = isOnline,
-                                    lastMessage = lastMsg.ifBlank { "Support Channel & Dispatch Line" },
-                                    timestamp = ts,
-                                    unreadCount = unreadCount,
-                                    status = status,
-                                    assignedTech = assignedTech
-                                )
-                            )
-                        }
                         // Include technician direct line if customer is participant or tech assigned
-                        else if (chatId.startsWith("tech_") && (chatId.endsWith("_$currentUserId") || participantIds.contains(currentUserId))) {
+                        if (chatId.startsWith("tech_") && (chatId.endsWith("_$currentUserId") || participantIds.contains(currentUserId))) {
                             val techNameInChat = if (chatId.split("_").size >= 2) chatId.split("_")[1] else "Technician"
                             val techUser = userByName[techNameInChat.lowercase(Locale.getDefault())]
                             val techUid = techUser?.get("uid")?.toString()

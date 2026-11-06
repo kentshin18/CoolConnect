@@ -10,12 +10,28 @@ data class Product(
     val color: Color,
     val badge: String = "IN STOCK",
     val imageUrl: String? = null,
+    val imageUrls: List<String> = emptyList(),
     val description: String = "High-quality Smart HVAC & Home Automation hardware designed for energy efficiency and seamless integration.",
     val warranty: String = "1 Year Official Warranty & Tech Support",
     val specs: String = "Wi-Fi Enabled • Low Power Draw • App Controlled",
     val stock: Int = 10,
-    val docId: String = ""
-)
+    val docId: String = "",
+    val rating: Double = 5.0,
+    val reviewCount: Int = 0,
+    val soldCount: Int = 0
+) {
+    val galleryImages: List<String>
+        get() {
+            val list = mutableListOf<String>()
+            if (!imageUrl.isNullOrBlank()) list.add(imageUrl)
+            imageUrls.forEach { url ->
+                if (url.isNotBlank() && !list.contains(url)) {
+                    list.add(url)
+                }
+            }
+            return list
+        }
+}
 
 data class ChatMessage(
     val id: String = "",

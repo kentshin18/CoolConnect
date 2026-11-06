@@ -836,7 +836,9 @@ fun TechnicianMapView(
     val primaryJob by viewModel.primaryJob.collectAsState()
 
     var techLocation by remember { mutableStateOf<LatLng?>(null) }
-    var customerLocation by remember { mutableStateOf<LatLng?>(null) }
+    var liveCustomerLocation by remember { mutableStateOf<LatLng?>(null) }
+    var geocodedLocation by remember { mutableStateOf<LatLng?>(null) }
+    val customerLocation = liveCustomerLocation ?: geocodedLocation
     var isCameraInitialized by remember { mutableStateOf(false) }
 
     val cameraPositionState = rememberCameraPositionState()
@@ -900,29 +902,85 @@ fun TechnicianMapView(
 
     // Clean DisposableEffect for Customer Location of Primary Job
     val customerUid = remember(primaryJob) {
-        val rawCuid = primaryJob?.id ?: ""
+        val rawCuid = primaryJob?.customerId?.ifBlank { primaryJob?.id } ?: ""
         if (rawCuid.isNotBlank()) rawCuid.replace("admin_", "").replace("tech_", "") else null
     }
 
-    DisposableEffect(customerUid) {
+    DisposableEffect(customerUid, primaryJob?.id) {
+        val listeners = mutableListOf<com.google.firebase.firestore.ListenerRegistration>()
+
+        fun extractLatLng(doc: com.google.firebase.firestore.DocumentSnapshot?): LatLng? {
+            if (doc == null || !doc.exists()) return null
+            val lat = doc.getDouble("latitude") ?: doc.getDouble("lat") ?: doc.getDouble("customerLat")
+            val lng = doc.getDouble("longitude") ?: doc.getDouble("lng") ?: doc.getDouble("customerLng")
+            return if (lat != null && lng != null && (lat != 0.0 || lng != 0.0)) LatLng(lat, lng) else null
+        }
+
         if (!customerUid.isNullOrEmpty()) {
-            val listener = db.collection("users").document(customerUid).addSnapshotListener { doc, _ ->
-                if (doc != null && doc.exists()) {
-                    val lat = doc.getDouble("latitude")
-                    val lng = doc.getDouble("longitude")
-                    if (lat != null && lng != null) {
-                        customerLocation = LatLng(lat, lng)
+            listeners.add(
+                db.collection("users").document(customerUid).addSnapshotListener { userDoc, _ ->
+                    val userLoc = extractLatLng(userDoc)
+                    if (userLoc != null) {
+                        liveCustomerLocation = userLoc
                     } else {
-                        customerLocation = null
+                        db.collection("chats_v2").document("admin_$customerUid").get().addOnSuccessListener { chatDoc ->
+                            val chatLoc = extractLatLng(chatDoc)
+                            if (chatLoc != null) {
+                                liveCustomerLocation = chatLoc
+                            } else {
+                                liveCustomerLocation = null
+                            }
+                        }
                     }
-                } else {
-                    customerLocation = null
+                }
+            )
+        }
+
+        val reqId = primaryJob?.id
+        if (!reqId.isNullOrEmpty()) {
+            listeners.add(
+                db.collection("service_requests").document(reqId).addSnapshotListener { reqDoc, _ ->
+                    val reqLoc = extractLatLng(reqDoc)
+                    if (reqLoc != null) {
+                        liveCustomerLocation = reqLoc
+                    }
+                }
+            )
+        }
+
+        onDispose {
+            listeners.forEach { it.remove() }
+        }
+    }
+
+    // Fallback Geocoding for Customer Street Address if Live GPS is unavailable
+    LaunchedEffect(customerUid, primaryJob?.address, liveCustomerLocation) {
+        val addressStr = primaryJob?.address
+        if (liveCustomerLocation == null && !addressStr.isNullOrBlank() && addressStr != "No Address" && addressStr != "Fetching delivery address...") {
+            kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val geocoder = android.location.Geocoder(context, java.util.Locale.getDefault())
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+                        geocoder.getFromLocationName(addressStr, 1) { addresses ->
+                            if (!addresses.isNullOrEmpty()) {
+                                val first = addresses[0]
+                                geocodedLocation = LatLng(first.latitude, first.longitude)
+                            }
+                        }
+                    } else {
+                        @Suppress("DEPRECATION")
+                        val addresses = geocoder.getFromLocationName(addressStr, 1)
+                        if (!addresses.isNullOrEmpty()) {
+                            val first = addresses[0]
+                            geocodedLocation = LatLng(first.latitude, first.longitude)
+                        }
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.w("TechnicianMapView", "Geocoding fallback failed for '$addressStr': ${e.localizedMessage}")
                 }
             }
-            onDispose { listener.remove() }
-        } else {
-            customerLocation = null
-            onDispose { }
+        } else if (liveCustomerLocation != null) {
+            geocodedLocation = null
         }
     }
 
@@ -1147,29 +1205,69 @@ fun TechnicianTroubleshootView(
                 listState.animateScrollToItem(messages.size - 1)
             }
 
-            val result = viewModel.queryAiAssistant(trimmed, customerId = assignedCustomerId, customerName = assignedCustomerName)
-            val aiMsgIndex = messages.indexOfFirst { it.id == aiMsgId }
+            var fullBuffer = ""
+            var displayedText = ""
+            var hasStarted = false
 
-            if (aiMsgIndex != -1) {
-                result.onSuccess { fullResponse ->
-                    messages[aiMsgIndex] = messages[aiMsgIndex].copy(
-                        isPending = false,
-                        isStreaming = true,
-                        text = ""
-                    )
-
-                    val words = fullResponse.split(" ")
-                    var accumulated = ""
-                    for ((idx, word) in words.withIndex()) {
-                        accumulated += if (idx == 0) word else " $word"
-                        messages[aiMsgIndex] = messages[aiMsgIndex].copy(text = accumulated)
-                        delay(25.milliseconds)
+            try {
+                var streamError: Throwable? = null
+                val collectorJob = launch {
+                    try {
+                        viewModel.queryAiAssistantStream(trimmed, customerId = assignedCustomerId, customerName = assignedCustomerName)
+                            .collect { chunk ->
+                                fullBuffer += chunk
+                            }
+                    } catch (e: Throwable) {
+                        streamError = e
                     }
+                }
 
-                    messages[aiMsgIndex] = messages[aiMsgIndex].copy(isStreaming = false)
+                while (collectorJob.isActive || displayedText.length < fullBuffer.length) {
+                    if (streamError != null) {
+                        throw streamError!!
+                    }
+                    if (displayedText.length < fullBuffer.length) {
+                        val currentIdx = messages.indexOfFirst { it.id == aiMsgId }
+                        if (currentIdx != -1) {
+                            if (!hasStarted) {
+                                hasStarted = true
+                                messages[currentIdx] = messages[currentIdx].copy(
+                                    isPending = false,
+                                    isStreaming = true,
+                                    text = ""
+                                )
+                            }
+
+                            val remaining = fullBuffer.substring(displayedText.length)
+                            val spaceIdx = remaining.indexOf(' ')
+                            val stepSize = if (spaceIdx in 0..7) spaceIdx + 1 else minOf(4, remaining.length)
+
+                            displayedText += remaining.take(stepSize)
+                            messages[currentIdx] = messages[currentIdx].copy(text = displayedText)
+
+                            if (isAtBottom) {
+                                listState.animateScrollToItem(messages.size - 1)
+                            }
+                        }
+                        delay(18.milliseconds)
+                    } else {
+                        delay(20.milliseconds)
+                    }
+                }
+
+                if (streamError != null) {
+                    throw streamError!!
+                }
+
+                val currentIdx = messages.indexOfFirst { it.id == aiMsgId }
+                if (currentIdx != -1) {
+                    messages[currentIdx] = messages[currentIdx].copy(isPending = false, isStreaming = false, isError = false, text = fullBuffer)
                     viewModel.saveAiChatHistory(context)
-                }.onFailure { error ->
-                    messages[aiMsgIndex] = messages[aiMsgIndex].copy(
+                }
+            } catch (error: Exception) {
+                val currentIdx = messages.indexOfFirst { it.id == aiMsgId }
+                if (currentIdx != -1) {
+                    messages[currentIdx] = messages[currentIdx].copy(
                         isPending = false,
                         isStreaming = false,
                         isError = true,
@@ -1177,8 +1275,9 @@ fun TechnicianTroubleshootView(
                     )
                     viewModel.saveAiChatHistory(context)
                 }
+            } finally {
+                isAiGenerating = false
             }
-            isAiGenerating = false
         }
     }
 
@@ -1192,30 +1291,75 @@ fun TechnicianTroubleshootView(
             isAiGenerating = true
 
             coroutineScope.launch {
-                val result = viewModel.queryAiAssistant(prompt, customerId = assignedCustomerId, customerName = assignedCustomerName)
-                val currentIdx = messages.indexOfFirst { it.id == targetMsg.id }
+                var fullBuffer = ""
+                var displayedText = ""
+                var hasStarted = false
 
-                if (currentIdx != -1) {
-                    result.onSuccess { fullResponse ->
-                        messages[currentIdx] = messages[currentIdx].copy(isPending = false, isStreaming = true, text = "")
-                        val words = fullResponse.split(" ")
-                        var accumulated = ""
-                        for ((idx, word) in words.withIndex()) {
-                            accumulated += if (idx == 0) word else " $word"
-                            messages[currentIdx] = messages[currentIdx].copy(text = accumulated)
-                            delay(25.milliseconds)
+                try {
+                    var streamError: Throwable? = null
+                    val collectorJob = launch {
+                        try {
+                            viewModel.queryAiAssistantStream(prompt, customerId = assignedCustomerId, customerName = assignedCustomerName)
+                                .collect { chunk ->
+                                    fullBuffer += chunk
+                                }
+                        } catch (e: Throwable) {
+                            streamError = e
                         }
-                        messages[currentIdx] = messages[currentIdx].copy(isStreaming = false)
+                    }
+
+                    while (collectorJob.isActive || displayedText.length < fullBuffer.length) {
+                        if (streamError != null) {
+                            throw streamError!!
+                        }
+                        if (displayedText.length < fullBuffer.length) {
+                            val currentIdx = messages.indexOfFirst { it.id == targetMsg.id }
+                            if (currentIdx != -1) {
+                                if (!hasStarted) {
+                                    hasStarted = true
+                                    messages[currentIdx] = messages[currentIdx].copy(
+                                        isPending = false,
+                                        isStreaming = true,
+                                        text = ""
+                                    )
+                                }
+
+                                val remaining = fullBuffer.substring(displayedText.length)
+                                val spaceIdx = remaining.indexOf(' ')
+                                val stepSize = if (spaceIdx in 0..7) spaceIdx + 1 else minOf(4, remaining.length)
+
+                                displayedText += remaining.take(stepSize)
+                                messages[currentIdx] = messages[currentIdx].copy(text = displayedText)
+                            }
+                            delay(18.milliseconds)
+                        } else {
+                            delay(20.milliseconds)
+                        }
+                    }
+
+                    if (streamError != null) {
+                        throw streamError!!
+                    }
+
+                    val currentIdx = messages.indexOfFirst { it.id == targetMsg.id }
+                    if (currentIdx != -1) {
+                        messages[currentIdx] = messages[currentIdx].copy(isPending = false, isStreaming = false, isError = false, text = fullBuffer)
                         viewModel.saveAiChatHistory(context)
-                    }.onFailure { error ->
+                    }
+                } catch (error: Exception) {
+                    val currentIdx = messages.indexOfFirst { it.id == targetMsg.id }
+                    if (currentIdx != -1) {
                         messages[currentIdx] = messages[currentIdx].copy(
-                            isPending = false, isStreaming = false, isError = true,
+                            isPending = false,
+                            isStreaming = false,
+                            isError = true,
                             text = "Diagnostic Error: ${error.localizedMessage ?: "Failed to regenerate AI response."}"
                         )
                         viewModel.saveAiChatHistory(context)
                     }
+                } finally {
+                    isAiGenerating = false
                 }
-                isAiGenerating = false
             }
         }
     }

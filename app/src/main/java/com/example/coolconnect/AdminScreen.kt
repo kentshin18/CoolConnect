@@ -477,11 +477,13 @@ fun AdminBottomBar(currentTab: AdminTab, onTabSelected: (AdminTab) -> Unit) {
         shadowElevation = 8.dp,
         modifier = Modifier
             .fillMaxWidth()
-            .height(64.dp)
             .border(BorderStroke(0.5.dp, Color(0xFFE2E8F0)))
+            .navigationBarsPadding()
     ) {
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(64.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -1611,8 +1613,10 @@ fun AdminInventoryView(
                                             AsyncImage(
                                                 model = imageUrl,
                                                 contentDescription = name,
-                                                modifier = Modifier.fillMaxSize(),
-                                                contentScale = ContentScale.Crop
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .padding(6.dp),
+                                                contentScale = ContentScale.Fit
                                             )
                                         } else {
                                             Box(
@@ -2039,6 +2043,28 @@ fun InventoryDialog(
     var price by remember { mutableStateOf(product?.get("price")?.toString() ?: "1500") }
     var badge by remember { mutableStateOf(product?.get("badge")?.toString() ?: "IN STOCK") }
     var imageUrl by remember { mutableStateOf(product?.get("imageUrl")?.toString() ?: "") }
+    @Suppress("UNCHECKED_CAST")
+    val initialExtraUrls = remember(product) {
+        (product?.get("imageUrls") as? List<String>) ?: emptyList()
+    }
+    val extraImageUrls = remember { mutableStateListOf<String>().apply { addAll(initialExtraUrls) } }
+    var newPhotoUrlInput by remember { mutableStateOf("") }
+    var showAddUrlField by remember { mutableStateOf(false) }
+
+    val imagePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            val uriStr = uri.toString()
+            if (imageUrl.isBlank()) {
+                imageUrl = uriStr
+            } else if (!extraImageUrls.contains(uriStr)) {
+                extraImageUrls.add(uriStr)
+            }
+            Toast.makeText(context, "Photo added to gallery!", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     var description by remember { mutableStateOf(product?.get("description")?.toString() ?: "High-quality HVAC replacement part designed for heavy-duty operation.") }
     var specs by remember { mutableStateOf(product?.get("specs")?.toString() ?: "HVAC Grade • High Efficiency") }
     var warranty by remember { mutableStateOf(product?.get("warranty")?.toString() ?: "1 Year Official Warranty") }
@@ -2135,8 +2161,10 @@ fun InventoryDialog(
                                 AsyncImage(
                                     model = imageUrl,
                                     contentDescription = "Product Image",
-                                    modifier = Modifier.fillMaxSize(),
-                                    contentScale = ContentScale.Crop
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .padding(6.dp),
+                                    contentScale = ContentScale.Fit
                                 )
                             } else {
                                 Column(
@@ -2314,7 +2342,7 @@ fun InventoryDialog(
                         OutlinedTextField(
                             value = imageUrl,
                             onValueChange = { imageUrl = it },
-                            label = { Text("Image Direct Path / Local URI", fontSize = 12.sp) },
+                            label = { Text("Main Image URL / Local URI", fontSize = 12.sp) },
                             placeholder = { Text("e.g. file:///... or image path", fontSize = 12.sp) },
                             modifier = Modifier.weight(1f),
                             singleLine = true,
@@ -2324,6 +2352,154 @@ fun InventoryDialog(
                                 unfocusedBorderColor = Color(0xFFCBD5E1)
                             )
                         )
+                    }
+
+                    // MULTI-PHOTO GALLERY MANAGEMENT SECTION
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Product Photos & Angles", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = TextDark)
+                            
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OutlinedButton(
+                                    onClick = { imagePickerLauncher.launch("image/*") },
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                    modifier = Modifier.height(30.dp)
+                                ) {
+                                    Icon(Icons.Default.AddPhotoAlternate, null, modifier = Modifier.size(14.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Upload Photo", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                }
+
+                                TextButton(
+                                    onClick = { showAddUrlField = !showAddUrlField },
+                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                    modifier = Modifier.height(30.dp)
+                                ) {
+                                    Text("+ Add URL", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = PrimaryBlue)
+                                }
+                            }
+                        }
+
+                        if (showAddUrlField) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                OutlinedTextField(
+                                    value = newPhotoUrlInput,
+                                    onValueChange = { newPhotoUrlInput = it },
+                                    placeholder = { Text("Paste image URL...", fontSize = 11.sp) },
+                                    modifier = Modifier.weight(1f).height(46.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    singleLine = true,
+                                    textStyle = TextStyle(fontSize = 11.sp, color = TextDark)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Button(
+                                    onClick = {
+                                        if (newPhotoUrlInput.isNotBlank()) {
+                                            val trimmed = newPhotoUrlInput.trim()
+                                            if (imageUrl.isBlank()) {
+                                                imageUrl = trimmed
+                                            } else if (!extraImageUrls.contains(trimmed)) {
+                                                extraImageUrls.add(trimmed)
+                                            }
+                                            newPhotoUrlInput = ""
+                                            showAddUrlField = false
+                                        }
+                                    },
+                                    modifier = Modifier.height(46.dp),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
+                                ) {
+                                    Text("Add", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(8.dp))
+
+                        val allPhotos = remember(imageUrl, extraImageUrls.toList()) {
+                            val list = mutableListOf<Pair<String, Boolean>>()
+                            if (imageUrl.isNotBlank()) list.add(Pair(imageUrl, true))
+                            extraImageUrls.forEach { u ->
+                                if (u.isNotBlank() && u != imageUrl) list.add(Pair(u, false))
+                            }
+                            list
+                        }
+
+                        if (allPhotos.isNotEmpty()) {
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                items(allPhotos) { (url, isMain) ->
+                                    Box(modifier = Modifier.size(70.dp)) {
+                                        Card(
+                                            shape = RoundedCornerShape(10.dp),
+                                            border = BorderStroke(if (isMain) 2.dp else 1.dp, if (isMain) PrimaryBlue else Color(0xFFCBD5E1)),
+                                            colors = CardDefaults.cardColors(containerColor = AppLightBg),
+                                            modifier = Modifier.fillMaxSize().clickable {
+                                                if (!isMain) {
+                                                    val oldMain = imageUrl
+                                                    imageUrl = url
+                                                    extraImageUrls.remove(url)
+                                                    if (oldMain.isNotBlank() && !extraImageUrls.contains(oldMain)) {
+                                                        extraImageUrls.add(oldMain)
+                                                    }
+                                                }
+                                            }
+                                        ) {
+                                            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                                AsyncImage(
+                                                    model = url,
+                                                    contentDescription = "Angle",
+                                                    modifier = Modifier.fillMaxSize().padding(4.dp),
+                                                    contentScale = ContentScale.Fit
+                                                )
+
+                                                Surface(
+                                                    color = if (isMain) PrimaryBlue else Color.Black.copy(0.6f),
+                                                    shape = RoundedCornerShape(topStart = 8.dp, bottomEnd = 6.dp),
+                                                    modifier = Modifier.align(Alignment.TopStart)
+                                                ) {
+                                                    Text(
+                                                        text = if (isMain) "MAIN" else "ANGLE",
+                                                        color = Color.White,
+                                                        fontSize = 7.sp,
+                                                        fontWeight = FontWeight.Black,
+                                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        IconButton(
+                                            onClick = {
+                                                if (isMain) {
+                                                    if (extraImageUrls.isNotEmpty()) {
+                                                        imageUrl = extraImageUrls.removeAt(0)
+                                                    } else {
+                                                        imageUrl = ""
+                                                    }
+                                                } else {
+                                                    extraImageUrls.remove(url)
+                                                }
+                                            },
+                                            modifier = Modifier
+                                                .size(20.dp)
+                                                .align(Alignment.TopEnd)
+                                                .background(Color.Red, CircleShape)
+                                        ) {
+                                            Icon(Icons.Default.Close, "Remove Photo", tint = Color.White, modifier = Modifier.size(12.dp))
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Description
@@ -2386,6 +2562,7 @@ fun InventoryDialog(
                                             "stock" to (stock.toIntOrNull() ?: 10),
                                             "badge" to badge.trim(),
                                             "imageUrl" to imageUrl.trim(),
+                                            "imageUrls" to extraImageUrls.filter { it.isNotBlank() },
                                             "description" to description.trim(),
                                             "specs" to specs.trim(),
                                             "warranty" to warranty.trim(),
